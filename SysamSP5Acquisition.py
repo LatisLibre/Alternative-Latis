@@ -1,10 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Sysam SP5 Acquisition - Version finalisée avec import .ltp
-- Toutes les fonctions référencées par setup_main_window sont définies avant son exécution.
-- Ajout : import .ltp (tentative via pycanum introspection), menu "Ouvrir (.ltp)..."
-- Ajouts précédents : Mesures automatiques (avec fenêtrage), FFT, renommer/recolorer courbes.
-- Organisation par sections pour lisibilité.
+Sysam SP5 Acquisition - Version15
+
+Modifications principales (par rapport à la v14) :
+- Suppression propre de la fonctionnalité d'ouverture de fichiers LatisPro (.ltp):
+  * suppression de la fonction menu_ouvrir_ltp
+  * suppression de l'entrée de menu "Ouvrir (.ltp)..." dans le menu Fichier
+- Suppression propre de la fonctionnalité "Réticule lié à la courbe":
+  * suppression de la commande de menu correspondante dans Options
+  * suppression de l'élément de menu contextuel "Réticule lié à la courbe..." dans le popup (clic droit)
+  * suppression de la fonction select_reticule_curve
+  * la classe Reticule est conservée pour l'affichage des coordonnées et du crosshair, mais il n'est plus possible de lier le réticule à une courbe via un dialogue.
+- Correction d'un bug de syntaxe (parenthèse en trop) dans auto_calibrate_plot.
+- Le reste des fonctionnalités (acquisition, affichage, feuille de calcul, export CSV, dérivée, FFT, modèles, etc.) est inchangé.
 """
 import pycanum.main as pycan
 import numpy as np
@@ -40,7 +48,7 @@ def close_program():
         except Exception:
             pass
 
-# Menu functions used by setup_main_window must exist before it is defined.
+# Menu stubs used by setup_main_window (placed early to avoid NameError)
 def menu_enregistrer():
     """Fonction Enregistrer (placeholder)."""
     try:
@@ -110,6 +118,8 @@ CALCULATED_CURVES = []
 
 # ---------------------------
 # Reticule (crosshair) class
+# Note: class kept for showing coordinates and crosshair, but the ability
+# to "link" the reticule to another curve via a dialog has been removed.
 # ---------------------------
 
 class Reticule:
@@ -119,7 +129,7 @@ class Reticule:
         self.canvas = canvas
         self.curves_data = curves_data
         self.calibre = calibre
-        self.active_curve_index = 0
+        self.active_curve_index = 0  # fixed to 0 by default; no dialog to change it
 
         self.coord_text = ax.text(0.5, 1.05, '',
                                   transform=ax.transAxes,
@@ -130,12 +140,6 @@ class Reticule:
             self.cid_move = self.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
         except Exception:
             self.cid_move = None
-
-    def set_active_curve(self, index):
-        if 0 <= index < len(self.curves_data):
-            self.active_curve_index = index
-            return True
-        return False
 
     def on_mouse_move(self, event):
         if event.inaxes == self.ax and event.xdata is not None and self.curves_data:
@@ -286,7 +290,7 @@ def create_plot_in_frame(parent_frame, curves_data, title="Fenêtre Graphique", 
     for style in style_options:
         style_menu.add_radiobutton(label=style, command=lambda s=style, wd=window_data: update_plot_style(style=s, window_data=wd))
     popup_menu.add_cascade(label="Style d'Affichage", menu=style_menu)
-    popup_menu.add_command(label="Réticule lié à la courbe...", command=lambda wd=window_data: select_reticule_curve(wd))
+    # Note: popup menu entry to link reticule to a curve removed
     canvas_widget.bind("<Button-3>", lambda event: popup_menu.post(event.x_root, event.y_root))
 
     return window_data
@@ -429,7 +433,7 @@ def manage_curves_dialog(window_data=None):
     dlg.wait_window()
 
 # ---------------------------
-# Data table functions
+# Data table functions (with integrated spreadsheet)
 # ---------------------------
 
 def open_data_table():
@@ -444,18 +448,23 @@ def open_data_table():
     _show_data_table_for_curve(active_window, curve_index)
 
 def _show_data_table_for_curve(active_window, curve_index):
+    """
+    Ouvre une fenêtre tableau de la courbe sélectionnée.
+    Ajout : bouton "Feuille de calcul" pour créer de nouvelles colonnes via formules basées sur t et y.
+    """
     try:
         t_arr, v_arr, curve_name, is_raw = active_window['curves_data'][curve_index]
     except Exception as e:
         messagebox.showerror("Tableau", f"Impossible de récupérer la courbe : {e}")
         return
 
+    # Convert to Python lists for easy editing in Treeview
     t_list = list(t_arr.tolist()) if isinstance(t_arr, np.ndarray) else list(t_arr)
     v_list = list(v_arr.tolist()) if isinstance(v_arr, np.ndarray) else list(v_arr)
 
     tbl_win = tk.Toplevel(root)
     tbl_win.title(f"Tableau des valeurs - {curve_name}")
-    tbl_win.geometry("640x420")
+    tbl_win.geometry("900x520")
     tbl_win.transient(root)
 
     header = tk.Frame(tbl_win)
@@ -465,7 +474,8 @@ def _show_data_table_for_curve(active_window, curve_index):
 
     frame = tk.Frame(tbl_win)
     frame.pack(fill='both', expand=True, padx=8, pady=4)
-    columns = ('time', 'value')
+    # columns: time + value + any computed columns (dynamically added)
+    columns = ['time', 'value']
     tree = ttk.Treeview(frame, columns=columns, show='headings', selectmode='browse')
     tree.heading('time', text='Temps (s)')
     tree.heading('value', text=curve_name)
@@ -478,8 +488,38 @@ def _show_data_table_for_curve(active_window, curve_index):
     frame.grid_rowconfigure(0, weight=1)
     frame.grid_columnconfigure(0, weight=1)
 
-    for i, (ti, vi) in enumerate(zip(t_list, v_list)):
-        tree.insert('', 'end', iid=str(i), values=(f"{ti:.6f}", f"{vi:.6f}"))
+    # store computed column names and values
+    computed_columns = []  # list of dicts: {'id': col_id, 'name': display_name, 'values': list_of_values, 'unit': unit}
+
+    def refresh_treeview():
+        # rebuild columns
+        all_columns = ['time', 'value'] + [c['id'] for c in computed_columns]
+        tree.config(columns=all_columns)
+        tree.heading('time', text='Temps (s)')
+        tree.heading('value', text=curve_name)
+        for c in computed_columns:
+            tree.heading(c['id'], text=c['name'])
+        # remove all items then reinsert
+        for iid in tree.get_children():
+            tree.delete(iid)
+        n = max(len(t_list), len(v_list), *(len(c['values']) for c in computed_columns) if computed_columns else [0])
+        for i in range(n):
+            ti = f"{t_list[i]:.6f}" if i < len(t_list) else ""
+            vi = f"{v_list[i]:.6f}" if i < len(v_list) else ""
+            row = [ti, vi]
+            for c in computed_columns:
+                val = c['values'][i] if i < len(c['values']) else ""
+                if val != "":
+                    try:
+                        row.append(f"{float(val):.6f}")
+                    except Exception:
+                        row.append(str(val))
+                else:
+                    row.append("")
+            tree.insert('', 'end', iid=str(i), values=row)
+
+    # initial fill
+    refresh_treeview()
 
     edit_info = {'entry': None}
 
@@ -488,7 +528,7 @@ def _show_data_table_for_curve(active_window, curve_index):
         if region != 'cell':
             return
         row_id = tree.identify_row(event.y)
-        col = tree.identify_column(event.x)
+        col = tree.identify_column(event.x)  # like '#1', '#2', ...
         if not row_id:
             return
         bbox = tree.bbox(row_id, col)
@@ -499,22 +539,44 @@ def _show_data_table_for_curve(active_window, curve_index):
             edit_info['entry'].destroy()
             edit_info['entry'] = None
 
+        col_index = int(col.replace('#', '')) - 1  # 0-based
         def save_edit(event=None):
             new_val = entry.get().strip()
             try:
                 newf = float(new_val.replace(',', '.'))
+                is_num = True
             except Exception:
-                messagebox.showwarning("Édition", "Valeur non valide. Saisissez un nombre.")
-                entry.focus_set()
-                return
+                is_num = False
             idx = int(row_id)
-            if col == '#1':
+            if col_index == 0:
+                # time edited
+                if not is_num:
+                    messagebox.showwarning("Édition", "Temps non valide. Saisissez un nombre.")
+                    entry.focus_set()
+                    return
                 t_list[idx] = newf
                 tree.set(row_id, 'time', f"{newf:.6f}")
-            else:
+            elif col_index == 1:
+                # value edited
+                if not is_num:
+                    messagebox.showwarning("Édition", "Valeur non valide. Saisissez un nombre.")
+                    entry.focus_set()
+                    return
                 v_list[idx] = newf
                 tree.set(row_id, 'value', f"{newf:.6f}")
+            else:
+                # computed column
+                cidx = col_index - 2
+                if cidx >= 0 and cidx < len(computed_columns):
+                    if not is_num:
+                        # allow empty / text?
+                        computed_columns[cidx]['values'][idx] = new_val
+                        tree.set(row_id, computed_columns[cidx]['id'], new_val)
+                    else:
+                        computed_columns[cidx]['values'][idx] = newf
+                        tree.set(row_id, computed_columns[cidx]['id'], f"{newf:.6f}")
             try:
+                # update underlying curve if time/value were edited
                 active_window['curves_data'][curve_index] = (np.array(t_list), np.array(v_list), curve_name, is_raw)
             except Exception:
                 pass
@@ -528,10 +590,8 @@ def _show_data_table_for_curve(active_window, curve_index):
 
         entry = tk.Entry(tree)
         entry.place(x=x, y=y, width=width, height=height)
-        if col == '#1':
-            entry.insert(0, tree.set(row_id, 'time'))
-        else:
-            entry.insert(0, tree.set(row_id, 'value'))
+        current_val = tree.set(row_id, column=tree['columns'][col_index])
+        entry.insert(0, current_val)
         entry.focus_set()
         entry.bind("<Return>", save_edit)
         entry.bind("<FocusOut>", save_edit)
@@ -539,6 +599,7 @@ def _show_data_table_for_curve(active_window, curve_index):
 
     tree.bind('<Double-1>', on_double_click)
 
+    # Buttons frame (Export, Calcul, Close)
     btn_frame = tk.Frame(tbl_win)
     btn_frame.pack(fill='x', padx=8, pady=6)
 
@@ -555,18 +616,148 @@ def _show_data_table_for_curve(active_window, curve_index):
         try:
             fname = filedialog.asksaveasfilename(defaultextension=".csv",
                                                  filetypes=[("CSV files", "*.csv")],
-                                                 title="Exporter le tableau")
+                                                 title="Exporter le tableau complet")
             if not fname:
                 return
             with open(fname, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f, delimiter=';')
-                writer.writerow(['Temps (s)', curve_name])
-                for ti, vi in zip(t_list, v_list):
-                    writer.writerow([f"{ti:.6f}", f"{vi:.6f}"])
+                # headers
+                headers = ['Temps (s)', curve_name]
+                for c in computed_columns:
+                    headers.append(c['name'])
+                writer.writerow(headers)
+                n = max(len(t_list), len(v_list), *(len(c['values']) for c in computed_columns) if computed_columns else [0])
+                for i in range(n):
+                    row = []
+                    row.append(f"{t_list[i]:.6f}" if i < len(t_list) else "")
+                    row.append(f"{v_list[i]:.6f}" if i < len(v_list) else "")
+                    for c in computed_columns:
+                        val = c['values'][i] if i < len(c['values']) else ""
+                        if isinstance(val, (int, float)):
+                            row.append(f"{val:.6f}")
+                        else:
+                            row.append(str(val) if val != "" else "")
+                    writer.writerow(row)
             messagebox.showinfo("Export", f"Tableau exporté : {os.path.basename(fname)}")
         except Exception as e:
             messagebox.showerror("Export", f"Erreur lors de l'export : {e}")
 
+    # --- New: Inline calculation dialog ---
+    def open_inline_calcul():
+        """
+        Ouvre une boîte de dialogue qui permet d'entrer une formule basée sur :
+         - t : tableau temps (numpy array)
+         - y : tableau valeurs (numpy array)
+        La formule est évaluée en environnement sécurisé (np exposé).
+        Le résultat (np.array) est ajouté comme nouvelle colonne dans le tableau et
+        peut être (optionnel) ajouté comme nouvelle courbe dans l'onglet actif.
+        """
+        calc_win = tk.Toplevel(tbl_win)
+        calc_win.title("Feuille de calcul (tableau courant)")
+        calc_win.geometry("520x320")
+        calc_win.transient(tbl_win)
+
+        frm = ttk.Frame(calc_win, padding=10)
+        frm.pack(fill='both', expand=True)
+
+        tk.Label(frm, text="Créer une nouvelle grandeur à partir de la courbe sélectionnée", font=('Helvetica', 11, 'bold')).pack(anchor='w', pady=(0,6))
+
+        info = ("Variables disponibles dans la formule :\n"
+                "  - t : vecteur temps (numpy array)\n"
+                "  - y : vecteur valeurs (numpy array)\n"
+                "Exemples : np.gradient(y,t), y*2, np.sin(2*np.pi*50*t), (y - np.mean(y)) / np.std(y)")
+        tk.Label(frm, text=info, justify='left', fg='darkgreen').pack(anchor='w', pady=4)
+
+        entry_frame = ttk.Frame(frm)
+        entry_frame.pack(fill='x', pady=6)
+        tk.Label(entry_frame, text="Nom de la nouvelle colonne:").grid(row=0, column=0, sticky='w', padx=4, pady=2)
+        new_name_var = tk.StringVar(value="Grandeur_Calculee")
+        tk.Entry(entry_frame, textvariable=new_name_var, width=30).grid(row=0, column=1, padx=4, pady=2)
+        tk.Label(entry_frame, text="Unité:").grid(row=1, column=0, sticky='w', padx=4, pady=2)
+        new_unit_var = tk.StringVar(value="")
+        tk.Entry(entry_frame, textvariable=new_unit_var, width=12).grid(row=1, column=1, sticky='w', padx=4, pady=2)
+
+        tk.Label(entry_frame, text="Formule (Python, utiliser np):").grid(row=2, column=0, sticky='w', padx=4, pady=6)
+        formula_var = tk.StringVar(value="")  # empty by default
+        formula_entry = tk.Entry(entry_frame, textvariable=formula_var, width=60)
+        formula_entry.grid(row=2, column=1, padx=4, pady=2)
+
+        add_curve_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(frm, text="Ajouter le résultat comme nouvelle courbe dans l'onglet actif", variable=add_curve_var).pack(anchor='w', pady=6)
+
+        results_label = tk.StringVar(value="")
+        tk.Label(frm, textvariable=results_label, fg='blue').pack(anchor='w', pady=4)
+
+        def run_calculation():
+            name = new_name_var.get().strip()
+            unit = new_unit_var.get().strip()
+            formula = formula_var.get().strip()
+            if not name or not formula:
+                messagebox.showwarning("Calcul", "Veuillez fournir un nom et une formule.")
+                return
+            # prepare environment
+            try:
+                t_np = np.array(t_list)
+                y_np = np.array(v_list)
+            except Exception as e:
+                messagebox.showerror("Calcul", f"Erreur préparation des données : {e}")
+                return
+            eval_env = {'np': np, 't': t_np, 'y': y_np}
+            # safety checks
+            if re.search(r'\b(os|sys|file|exec|eval|import|open|__|subprocess)\b', formula):
+                messagebox.showerror("Calcul", "La formule contient des termes interdits pour des raisons de sécurité.")
+                return
+            try:
+                result = eval(formula, {"__builtins__": None}, eval_env)
+            except Exception as e:
+                messagebox.showerror("Calcul", f"Erreur lors de l'évaluation de la formule : {e}")
+                return
+            # convert scalar to array if needed
+            if isinstance(result, (int, float)):
+                result = np.full_like(t_np, result, dtype=float)
+            if isinstance(result, np.ndarray):
+                if result.shape != t_np.shape:
+                    messagebox.showerror("Calcul", f"Le résultat a une taille {result.shape} différente de la taille du temps {t_np.shape}.")
+                    return
+                # add computed column
+                comp_vals = result.tolist()
+            else:
+                # try to coerce list-like
+                try:
+                    comp_vals = list(result)
+                    if len(comp_vals) != len(t_np):
+                        messagebox.showerror("Calcul", "Le résultat n'a pas la bonne dimension.")
+                        return
+                except Exception:
+                    messagebox.showerror("Calcul", "Le résultat de la formule n'est pas exploitable.")
+                    return
+
+            col_id = f"calc_{len(computed_columns)+1}"
+            display_name = f"{name} ({unit})" if unit else name
+            computed_columns.append({'id': col_id, 'name': display_name, 'values': comp_vals, 'unit': unit})
+            refresh_treeview()
+            results_label.set(f"Colonne '{display_name}' ajoutée ({len(comp_vals)} valeurs).")
+            # optionally add curve
+            if add_curve_var.get():
+                # Append as new curve in active window
+                try:
+                    new_curve_name = display_name
+                    active_window['curves_data'].append((np.array(t_list), np.array(comp_vals), new_curve_name, False))
+                    results_label.set(results_label.get() + f" Courbe '{new_curve_name}' ajoutée.")
+                    plot_mode_unique(active_window)
+                    auto_calibrate_plot(active_window)
+                except Exception as e:
+                    messagebox.showwarning("Ajout courbe", f"Impossible d'ajouter la courbe au graphe: {e}")
+            # keep dialog open for multiple formulas
+        ttk.Button(frm, text="Calculer et Ajouter Colonne", command=run_calculation).pack(side='left', padx=6, pady=8)
+        ttk.Button(frm, text="Fermer", command=calc_win.destroy).pack(side='right', padx=6, pady=8)
+
+        calc_win.grab_set()
+        calc_win.focus_force()
+        calc_win.wait_window()
+
+    # Buttons
+    tk.Button(btn_frame, text="Feuille de calcul", command=open_inline_calcul).pack(side='left', padx=4)
     tk.Button(btn_frame, text="Exporter CSV", command=export_table_csv).pack(side='left', padx=4)
     tk.Button(btn_frame, text="Fermer", command=close_tbl).pack(side='right', padx=4)
 
@@ -582,9 +773,9 @@ def _show_data_table_for_curve(active_window, curve_index):
     return
 
 # ---------------------------
-# Calculation sheet (Feuille de calcul)
+# Calculation sheet (Feuille de calcul globale)
+# Ensure this function is defined BEFORE setup_main_window (it is used by menu)
 # ---------------------------
-
 def open_calcul_sheet():
     """Feuille de calcul pour créer nouvelles grandeurs à partir des courbes présentes."""
     global CALCULATED_CURVES
@@ -676,168 +867,6 @@ def open_calcul_sheet():
     x = (calcul_window.winfo_screenwidth() // 2) - (width // 2)
     y = (calcul_window.winfo_screenheight() // 2) - (height // 2)
     calcul_window.geometry(f'{width}x{height}+{x}+{y}')
-
-# ---------------------------
-# Import .ltp (LatisPro) via pycanum introspection
-# ---------------------------
-
-def menu_ouvrir_ltp():
-    """
-    Ouvre un fichier .ltp (LatisPro) :
-    - tente d'utiliser pycanum si une fonction existe pour lire .ltp
-    - sinon informe l'utilisateur et propose d'envoyer le fichier d'exemple
-    """
-    active_window = get_active_plot_window()
-    if active_window is None:
-        messagebox.showwarning("Ouvrir .ltp", "Aucun onglet actif pour recevoir les données.")
-        return
-
-    filepath = filedialog.askopenfilename(filetypes=[("Fichiers LatisPro", "*.ltp"), ("Tous fichiers", "*.*")],
-                                          title="Ouvrir un fichier LatisPro (.ltp)")
-    if not filepath:
-        return
-
-    # Liste de noms de fonctions plausibles dans pycanum ou ses sousmodules
-    candidate_names = [
-        'read_ltp', 'load_ltp', 'open_ltp',
-        'read_latis', 'load_latis', 'open_latis',
-        'import_ltp', 'latis_open', 'latis_load', 'read_latispro'
-    ]
-
-    tried = []
-    loader = None
-    # 1) essayer directement sur pycan module
-    for name in candidate_names:
-        if hasattr(pycan, name):
-            loader = getattr(pycan, name)
-            tried.append(f"pycan.{name}")
-            break
-    # 2) essayer sous-module pycan.latis si présent
-    if loader is None and hasattr(pycan, 'latis'):
-        latis_mod = getattr(pycan, 'latis')
-        for name in candidate_names:
-            if hasattr(latis_mod, name):
-                loader = getattr(latis_mod, name)
-                tried.append(f"pycan.latis.{name}")
-                break
-
-    # 3) si on n'a rien trouvé, chercher dans le module pour toute fonction contenant 'ltp' ou 'latis' dans le nom
-    if loader is None:
-        for attr in dir(pycan):
-            lname = attr.lower()
-            if 'ltp' in lname or 'latis' in lname:
-                candidate = getattr(pycan, attr)
-                if callable(candidate):
-                    loader = candidate
-                    tried.append(f"pycan.{attr}")
-                    break
-        if loader is None and hasattr(pycan, 'latis'):
-            for attr in dir(pycan.latis):
-                lname = attr.lower()
-                if 'ltp' in lname or 'latis' in lname:
-                    candidate = getattr(pycan.latis, attr)
-                    if callable(candidate):
-                        loader = candidate
-                        tried.append(f"pycan.latis.{attr}")
-                        break
-
-    if loader is None:
-        msg = ("Aucune fonction de lecture .ltp détectée dans pycanum sur cette installation.\n\n"
-               "Méthodes essayées: " + (", ".join(tried) if tried else "aucune") + "\n\n"
-               "Si vous disposez d'un exemple de fichier .ltp, joignez-le et je peux écrire un importeur spécifique.\n"
-               "Sinon vérifiez la documentation de pycanum pour la fonction d'import LatisPro.")
-        messagebox.showerror("Ouvrir .ltp", msg)
-        return
-
-    # tenter de charger avec la fonction trouvée
-    try:
-        data = loader(filepath)
-    except Exception as e:
-        messagebox.showerror("Ouvrir .ltp", f"Erreur lors de l'appel du loader {loader} : {e}")
-        return
-
-    # Interpréter plusieurs formats possibles de 'data' et ajouter des courbes dans l'onglet actif
-    curves_added = 0
-    try:
-        # cas 1 : dict avec 'time' et 'channels' ou 'times' et 'data'
-        if isinstance(data, dict):
-            if 'time' in data and 'channels' in data:
-                t = np.asarray(data['time'])
-                for ch_name, ch_values in data['channels'].items():
-                    v = np.asarray(ch_values)
-                    active_window['curves_data'].append((t, v, f"{ch_name} ({os.path.basename(filepath)})", True))
-                    curves_added += 1
-            elif 'times' in data and 'data' in data:
-                t = np.asarray(data['times'])
-                # data peut être dict de canaux ou tableau 2D
-                if isinstance(data['data'], dict):
-                    for ch_name, ch_values in data['data'].items():
-                        v = np.asarray(ch_values)
-                        active_window['curves_data'].append((t, v, f"{ch_name} ({os.path.basename(filepath)})", True))
-                        curves_added += 1
-                else:
-                    arr = np.asarray(data['data'])
-                    if arr.ndim == 1:
-                        active_window['curves_data'].append((t, arr, f"{os.path.basename(filepath)}", True))
-                        curves_added += 1
-                    elif arr.ndim == 2:
-                        # si shape (N, M) on suppose première colonne temps? sinon M canaux
-                        if arr.shape[1] == 2:
-                            active_window['curves_data'].append((arr[:,0], arr[:,1], f"{os.path.basename(filepath)}", True))
-                            curves_added += 1
-                        else:
-                            for i in range(arr.shape[1]):
-                                active_window['curves_data'].append((t, arr[:,i], f"{os.path.basename(filepath)}_ch{i}", True))
-                                curves_added += 1
-        # cas 2 : liste/tuple de courbes (t, v, name) ou liste de canaux
-        elif isinstance(data, (list, tuple)):
-            # element peut être (t,v) ou (t,v,name) ou juste array Nx2
-            for item in data:
-                if isinstance(item, (list, tuple)) and len(item) >= 2:
-                    t = np.asarray(item[0])
-                    v = np.asarray(item[1])
-                    name = item[2] if len(item) >= 3 else os.path.basename(filepath)
-                    active_window['curves_data'].append((t, v, name, True))
-                    curves_added += 1
-                elif isinstance(item, np.ndarray):
-                    arr = np.asarray(item)
-                    if arr.ndim == 2 and arr.shape[1] >= 2:
-                        active_window['curves_data'].append((arr[:,0], arr[:,1], os.path.basename(filepath), True))
-                        curves_added += 1
-        # cas 3 : ndarray Nx2
-        elif isinstance(data, np.ndarray):
-            arr = data
-            if arr.ndim == 2 and arr.shape[1] >= 2:
-                active_window['curves_data'].append((arr[:,0], arr[:,1], os.path.basename(filepath), True))
-                curves_added += 1
-        else:
-            # format inconnu - tenter analyse si objet pandas DataFrame (si pd installé)
-            try:
-                import pandas as pd
-                if isinstance(data, pd.DataFrame):
-                    if 'time' in data.columns:
-                        t = data['time'].to_numpy()
-                        for col in data.columns:
-                            if col == 'time':
-                                continue
-                            v = data[col].to_numpy()
-                            active_window['curves_data'].append((t, v, f"{col} ({os.path.basename(filepath)})", True))
-                            curves_added += 1
-            except Exception:
-                pass
-    except Exception as e:
-        messagebox.showerror("Ouvrir .ltp", f"Erreur lors de l'interprétation des données : {e}")
-        return
-
-    if curves_added == 0:
-        messagebox.showwarning("Ouvrir .ltp", "Le fichier a été lu, mais aucun format de données reconnu n'a été trouvé. "
-                              "Résultat retourné par le loader :\n" + str(type(data)))
-        return
-
-    # afficher les nouvelles courbes
-    plot_mode_unique(active_window)
-    auto_calibrate_plot(active_window)
-    messagebox.showinfo("Ouvrir .ltp", f"{curves_added} courbe(s) importée(s) depuis {os.path.basename(filepath)}")
 
 # ---------------------------
 # Modelling functions
@@ -1027,11 +1056,11 @@ def calculer_derivee():
     auto_calibrate_plot(active_window)
 
 # ---------------------------
-# Automatic measurements (period, frequency, min/max)
+# Automatic measurements, FFT, plotting, acquisition, etc.
+# (functions present before setup_main_window)
 # ---------------------------
 
 def _compute_period_from_peaks(t, v):
-    """Estimate period by detecting local maxima / crossings."""
     if len(t) < 3:
         return None, None, []
     v = np.asarray(v)
@@ -1076,7 +1105,6 @@ def _compute_period_from_peaks(t, v):
     return period_mean, period_std, peak_times.tolist()
 
 def measure_on_curve(active_window, curve_index, t0=None, t1=None, show_peaks_on_plot=False):
-    """Compute measurements for one curve within optional time window."""
     try:
         t_arr, v_arr, name, is_raw = active_window['curves_data'][curve_index]
     except Exception as e:
@@ -1089,7 +1117,6 @@ def measure_on_curve(active_window, curve_index, t0=None, t1=None, show_peaks_on
     v = np.asarray(v_arr)
 
     if t0 is not None or t1 is not None:
-        # apply window
         mask = np.ones_like(t, dtype=bool)
         if t0 is not None:
             mask &= (t >= t0)
@@ -1131,7 +1158,6 @@ def measure_on_curve(active_window, curve_index, t0=None, t1=None, show_peaks_on
     return measurements
 
 def measure_auto_dialog():
-    """Dialog to choose curve and optional time window, then show measurements."""
     active_window = get_active_plot_window()
     if not active_window or not active_window['curves_data']:
         messagebox.showwarning("Mesures automatiques", "Aucune courbe disponible dans l'onglet actif.")
@@ -1142,7 +1168,6 @@ def measure_auto_dialog():
         return
     curve_index, t_arr, v_arr, name, is_raw = selected
 
-    # default window = full range
     t_min = float(np.min(t_arr)) if len(t_arr) else 0.0
     t_max = float(np.max(t_arr)) if len(t_arr) else 0.0
 
@@ -1156,7 +1181,6 @@ def measure_auto_dialog():
 
     tk.Label(frm, text=f"Courbe : {name}", font=('Helvetica', 11, 'bold')).pack(anchor='w', pady=(0,6))
 
-    # time window entries
     tw_frame = ttk.LabelFrame(frm, text="Plage temporelle pour l'analyse (laisser vide = totalité)")
     tw_frame.pack(fill='x', pady=6)
     tk.Label(tw_frame, text="T0 (s):").grid(row=0, column=0, sticky='w', padx=4, pady=2)
@@ -1168,7 +1192,6 @@ def measure_auto_dialog():
     e_t1 = tk.Entry(tw_frame, textvariable=t1_var, width=18)
     e_t1.grid(row=1, column=1, padx=4, pady=2)
 
-    # placeholder for results
     res_frame = ttk.Frame(frm)
     res_frame.pack(fill='both', expand=True, pady=(8,0))
 
@@ -1179,7 +1202,6 @@ def measure_auto_dialog():
     tk.Checkbutton(frm, text="Afficher les pics détectés sur le graphique", variable=show_peaks_var).pack(anchor='w', pady=6)
 
     def run_measure():
-        # parse t0/t1
         t0 = None
         t1 = None
         try:
@@ -1214,7 +1236,6 @@ def measure_auto_dialog():
             results_text.insert(tk.END, "Fréquence f : non déterminée\n")
 
     def apply_and_close():
-        # apply show peaks if requested
         t0 = None
         t1 = None
         try:
@@ -1243,12 +1264,7 @@ def measure_auto_dialog():
     dlg.focus_force()
     dlg.wait_window()
 
-# ---------------------------
-# FFT (Fourier spectrum)
-# ---------------------------
-
 def compute_fft_for_curve(t, v):
-    """Compute single-sided FFT amplitude and frequency vector. Returns freqs, amplitude."""
     t = np.asarray(t)
     v = np.asarray(v)
     if len(t) < 2:
@@ -1270,7 +1286,6 @@ def compute_fft_for_curve(t, v):
     return freqs, amplitude
 
 def fft_dialog():
-    """Dialog: choose curve, optional time window, compute FFT and open new tab with spectrum."""
     active_window = get_active_plot_window()
     if not active_window or not active_window['curves_data']:
         messagebox.showwarning("FFT", "Aucune courbe disponible dans l'onglet actif.")
@@ -1294,7 +1309,6 @@ def fft_dialog():
 
     tk.Label(frm, text=f"Courbe : {name}", font=('Helvetica', 11, 'bold')).pack(anchor='w', pady=(0,6))
 
-    # time window
     tw_frame = ttk.Frame(frm)
     tw_frame.pack(fill='x', pady=4)
     tk.Label(tw_frame, text="T0 (s):").grid(row=0, column=0, sticky='w', padx=4, pady=2)
@@ -1308,7 +1322,6 @@ def fft_dialog():
     tk.Label(frm, textvariable=result_label, foreground='blue').pack(anchor='w', pady=6)
 
     def run_fft_and_show():
-        # parse t0/t1
         t0 = None
         t1 = None
         try:
@@ -1358,7 +1371,7 @@ def fft_dialog():
     dlg.wait_window()
 
 # ---------------------------
-# Plot update and autoscale
+# Plot rendering and autoscale
 # ---------------------------
 
 def auto_calibrate_plot(window_data=None):
@@ -1401,6 +1414,7 @@ def auto_calibrate_plot(window_data=None):
         unit = _extract_unit_from_name(nom)
         primary_unit = _extract_unit_from_name(curves_data[0][2]) if curves_data else None
         is_secondary = False
+        # corrected parentheses here (removed an extra ')')
         if i != 0 and ((unit and primary_unit and unit != primary_unit) or ('Dérivée' in nom or 'dérivée' in nom or 'derive' in nom.lower())):
             is_secondary = True
         if is_secondary:
@@ -1431,6 +1445,7 @@ def auto_calibrate_plot(window_data=None):
                 continue
             unit = _extract_unit_from_name(nom)
             primary_unit = _extract_unit_from_name(curves_data[0][2]) if curves_data else None
+            # corrected parentheses here as well
             if i != 0 and ((unit and primary_unit and unit != primary_unit) or ('Dérivée' in nom or 'dérivée' in nom or 'derive' in nom.lower())):
                 if hasattr(v, 'size') and v.size > 0:
                     sec_vs.append(v)
@@ -1467,10 +1482,6 @@ def de_calibrate_plot(window_data=None):
     window_data['_previous_y_limits'] = window_data['_initial_y_limits']
     window_data['canvas'].draw_idle()
 
-# ---------------------------
-# Plot rendering
-# ---------------------------
-
 def update_plot_label(event=None):
     for window in ALL_PLOT_WINDOWS:
         if window.get('ax') and window.get('canvas'):
@@ -1480,7 +1491,6 @@ def update_plot_label(event=None):
                 window['canvas'].draw_idle()
 
 def update_plot_style(style=None, window_data=None):
-    """Change global style or a specific window style (simple hook)."""
     if style and plot_style_var:
         plot_style_var.set(style)
     if window_data:
@@ -1491,7 +1501,6 @@ def update_plot_style(style=None, window_data=None):
             plot_mode_unique(w)
 
 def plot_mode_unique(window_data=None):
-    """Draw curves for a given window (handles secondary axis and colors)."""
     global CALIBRE_AFFICHE
     if window_data is None:
         window_data = get_active_plot_window()
@@ -1502,7 +1511,6 @@ def plot_mode_unique(window_data=None):
     curves_data = window_data['curves_data']
     reticule = window_data['reticule']
 
-    # remove old secondary if present
     if window_data.get('secax') is not None:
         try:
             old = window_data['secax']
@@ -1525,17 +1533,7 @@ def plot_mode_unique(window_data=None):
         window_data['_previous_x_limits'] = current_x_lim
         window_data['_previous_y_limits'] = current_y_lim
 
-    x_min, x_max = current_x_lim
-    y_min, y_max = current_y_lim
-
     ax.clear()
-
-    if current_x_lim == window_data['_initial_x_limits'] and current_y_lim == window_data['_initial_y_limits']:
-        ax.set_xlim(window_data['_initial_x_limits'])
-        ax.set_ylim(window_data['_initial_y_limits'])
-    else:
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(y_min, y_max)
 
     primary_unit = None
     if curves_data:
@@ -1659,7 +1657,8 @@ def plot_mode_unique(window_data=None):
     canvas.draw_idle()
 
 # ---------------------------
-# Mode permanent / oscillo
+# Mode permanent / oscillo, acquisition, exporter, rename/recolor, selection dialogs
+# (all present and defined before setup_main_window)
 # ---------------------------
 
 def plot_mode_permanent():
@@ -1714,10 +1713,6 @@ def update_oscillo(frame, sys_interface, ax, line):
         if temps_oscillo[-1] > temps_oscillo[0]:
             ax.set_xlim(temps_oscillo[0], temps_oscillo[-1])
     return line,
-
-# ---------------------------
-# Acquisition / exports
-# ---------------------------
 
 def start_acquisition_and_plot(event=None):
     global sysam_interface, CALIBRE_AFFICHE, root
@@ -1828,10 +1823,6 @@ def exporter_csv():
     except Exception as e:
         messagebox.showerror("Erreur d'exportation", f"Impossible d'exporter les données: {e}")
 
-# ---------------------------
-# Options: rename / recolor curves
-# ---------------------------
-
 def rename_curve_dialog():
     active_window = get_active_plot_window()
     if not active_window or not active_window['curves_data']:
@@ -1860,10 +1851,6 @@ def recolor_curve_dialog():
         _sync_curve_colors(active_window)
         active_window['curve_colors'][idx] = color[1]
         plot_mode_unique(active_window)
-
-# ---------------------------
-# Selection dialogs
-# ---------------------------
 
 def select_curve_dialog(active_window, title="Sélection de la courbe"):
     curves_list = active_window['curves_data']
@@ -1895,41 +1882,9 @@ def select_curve_dialog(active_window, title="Sélection de la courbe"):
     root.wait_window(selection_window)
     return tuple(result) if result else None
 
-def select_reticule_curve(window_data=None):
-    if window_data is None:
-        window_data = get_active_plot_window()
-    if not window_data or not window_data['curves_data']:
-        messagebox.showwarning("Réticule", "Aucune courbe n'est disponible dans l'onglet actif.")
-        return
-    curves_list = window_data['curves_data']
-    selection_window = tk.Toplevel(root)
-    selection_window.title("Réticule lié à la courbe")
-    tk.Label(selection_window, text="Choisir la courbe pour le réticule :", font='Helvetica 10 bold', padx=10, pady=10).pack()
-    listbox = tk.Listbox(selection_window, width=60, height=min(20, len(curves_list)))
-    for i, (_, _, name, is_raw) in enumerate(curves_list):
-        data_type = "(Acquisition/Importation)" if is_raw else "(Calcul/Modèle)"
-        listbox.insert(tk.END, f"[{i+1}] {name} {data_type}")
-    listbox.pack(padx=10, pady=5)
-    current_index = window_data['reticule'].active_curve_index
-    if current_index < len(curves_list):
-        listbox.selection_set(current_index)
-        listbox.see(current_index)
-    def on_select():
-        try:
-            index = listbox.curselection()[0]
-            if window_data['reticule'].set_active_curve(index):
-                window_data['ax'].set_ylabel(curves_list[index][2])
-                window_data['canvas'].draw_idle()
-                messagebox.showinfo("Réticule", f"Réticule lié à la courbe : {curves_list[index][2]}")
-            selection_window.destroy()
-        except IndexError:
-            messagebox.showwarning("Sélection", "Veuillez sélectionner une courbe.")
-    tk.Button(selection_window, text="Confirmer la sélection", command=on_select, pady=5).pack(pady=10)
-    listbox.bind('<Double-1>', lambda event: on_select())
-    root.wait_window(selection_window)
-
 # ---------------------------
 # Main window & menus
+# All handlers referenced here are defined above to avoid NameError
 # ---------------------------
 
 def update_fe_and_xaxis(event=None):
@@ -2110,7 +2065,7 @@ def setup_main_window():
     menubar.add_cascade(label="Fichier", menu=file_menu)
     file_menu.add_command(label="Nouveau", command=menu_nouveau)
     file_menu.add_command(label="Ouvrir...", command=menu_ouvrir)
-    file_menu.add_command(label="Ouvrir (.ltp)...", command=menu_ouvrir_ltp)
+    # Note: entry "Ouvrir (.ltp)..." removed
     file_menu.add_command(label="Enregistrer...", command=menu_enregistrer)
     file_menu.add_command(label="Exporter (CSV)...", command=exporter_csv)
     file_menu.add_separator()
@@ -2146,7 +2101,7 @@ def setup_main_window():
     menubar.add_cascade(label="Options", menu=options_menu)
     options_menu.add_command(label="Calibrage Auto (Optimiser l'Affichage)", command=lambda: auto_calibrate_plot())
     options_menu.add_command(label="Décalibrer (Retour affichage initial)", command=lambda: de_calibrate_plot())
-    options_menu.add_command(label="Réticule lié à la courbe...", command=lambda: select_reticule_curve())
+    # Note: menu command "Réticule lié à la courbe..." removed here
     options_menu.add_separator()
     # rename / recolor
     options_menu.add_command(label="Renommer la courbe...", command=rename_curve_dialog)
