@@ -1,1 +1,3 @@
-LatisLibre est un projet d'alternative au programme LatisPro
+LatisLibre est un projet d'alternative Libre au programme LatisPro
+ecrit  avec python3 et pycanum
+
