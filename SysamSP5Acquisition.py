@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Sysam SP5 Acquisition - Version consolidée
-Fichier complet et réorganisé : toutes les fonctions appelées par l'initialisation
-sont définies avant setup_main_window pour éviter les NameError.
+Sysam SP5 Acquisition - Version finalisée avec import .ltp
+- Toutes les fonctions référencées par setup_main_window sont définies avant son exécution.
+- Ajout : import .ltp (tentative via pycanum introspection), menu "Ouvrir (.ltp)..."
+- Ajouts précédents : Mesures automatiques (avec fenêtrage), FFT, renommer/recolorer courbes.
+- Organisation par sections pour lisibilité.
 """
 import pycanum.main as pycan
 import numpy as np
@@ -10,7 +12,7 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from scipy.optimize import curve_fit
 import tkinter as tk
-from tkinter import messagebox, filedialog
+from tkinter import messagebox, filedialog, simpledialog, colorchooser
 from tkinter import ttk
 import sys as sys_module
 import csv
@@ -19,7 +21,10 @@ import re
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
-# --- Fonction utilitaire pour quitter proprement l'application (doit exister tôt) ---
+# ---------------------------
+# Basic utilities / startup
+# ---------------------------
+
 def close_program():
     """Ferme proprement la fenêtre Tkinter et termine le programme."""
     global root
@@ -33,10 +38,27 @@ def close_program():
         try:
             sys_module.exit(0)
         except Exception:
-            # fallback silent
             pass
 
-# --- CONFIGURATION GLOBALE ---
+# Menu functions used by setup_main_window must exist before it is defined.
+def menu_enregistrer():
+    """Fonction Enregistrer (placeholder)."""
+    try:
+        messagebox.showinfo("Enregistrer", "La fonction 'Enregistrer' n'est pas encore implémentée.")
+    except Exception:
+        pass
+
+def menu_copier():
+    """Fonction Copier (placeholder)."""
+    try:
+        messagebox.showinfo("Copier", "La fonction 'Copier' n'est pas encore implémentée.")
+    except Exception:
+        pass
+
+# ---------------------------
+# Global configuration & state
+# ---------------------------
+
 class Config:
     FE = 5000.0
     DUREE = 0.02
@@ -52,14 +74,13 @@ class Config:
     PLOT_STYLE = "Points + Courbe"
     DEFAULT_Y_MARGIN = 1.1
 
-# --- VARIABLES GLOBALES ---
 sysam_interface = None
 CALIBRE_AFFICHE = Config.CALIBRE
-ALL_CURVES = []  # contenu de l'onglet principal par défaut
+ALL_CURVES = []         # default curves for main tab
 N_POINTS_OSCILLO = 1000
 root = None
 
-# UI globals (initialisés dans setup_main_window)
+# UI variables (initialized in setup_main_window)
 grandeur_physique_var = None
 duree_var = None
 superposition_var = None
@@ -87,7 +108,10 @@ plot_style_var = None
 
 CALCULATED_CURVES = []
 
-# --- RETICULE (curseurs interactifs) ---
+# ---------------------------
+# Reticule (crosshair) class
+# ---------------------------
+
 class Reticule:
     def __init__(self, ax, fig, canvas, curves_data, calibre):
         self.ax = ax
@@ -102,7 +126,6 @@ class Reticule:
                                   ha='center', fontsize=10, visible=False)
         self.v_line = ax.axvline(x=0, color='r', linestyle='--', linewidth=0.8, visible=False)
         self.h_line = ax.axhline(y=0, color='b', linestyle='--', linewidth=0.8, visible=False)
-        # bind to canvas events
         try:
             self.cid_move = self.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
         except Exception:
@@ -161,7 +184,10 @@ class Reticule:
             if self.fig and self.fig.canvas:
                 self.fig.canvas.draw_idle()
 
-# --- UTILITAIRES (unités, flags visibilité) ---
+# ---------------------------
+# Helpers: names, flags, colors
+# ---------------------------
+
 def _extract_unit_from_name(name):
     if not name or '(' not in name or ')' not in name:
         return None
@@ -181,6 +207,17 @@ def _sync_visible_flags(window_data):
         flags = flags[:n]
     window_data['visible_flags'] = flags
 
+def _sync_curve_colors(window_data):
+    """Ensure window_data['curve_colors'] matches number of curves (None = default)."""
+    curves = window_data.get('curves_data', [])
+    colors = window_data.get('curve_colors', [])
+    n = len(curves)
+    if len(colors) < n:
+        colors.extend([None] * (n - len(colors)))
+    elif len(colors) > n:
+        colors = colors[:n]
+    window_data['curve_colors'] = colors
+
 def get_active_plot_window():
     global plot_notebook, ALL_PLOT_WINDOWS
     if not plot_notebook or not ALL_PLOT_WINDOWS:
@@ -194,7 +231,10 @@ def get_active_plot_window():
         return ALL_PLOT_WINDOWS[0]
     return None
 
-# --- CREATION D'ONGLET / FIGURE ---
+# ---------------------------
+# Plot creation and tabs
+# ---------------------------
+
 def create_plot_in_frame(parent_frame, curves_data, title="Fenêtre Graphique", y_label="Tension (V)"):
     fig, ax = plt.subplots(figsize=(6, 4), dpi=100)
     ax.set_title(title)
@@ -232,7 +272,8 @@ def create_plot_in_frame(parent_frame, curves_data, title="Fenêtre Graphique", 
         'secax': None,
         'sec_color': 'tab:red',
         'removed_curves': [],
-        'visible_flags': []
+        'visible_flags': [],
+        'curve_colors': []   # optional user-chosen colors
     }
 
     # popup menu (clic droit)
@@ -252,6 +293,8 @@ def create_plot_in_frame(parent_frame, curves_data, title="Fenêtre Graphique", 
 
 def open_new_plot_window_tab(curves_to_plot=None, title_suffix=""):
     global plot_notebook, ALL_PLOT_WINDOWS
+    if plot_notebook is None:
+        return None
     new_tab_frame = tk.Frame(plot_notebook)
     new_curves_list = curves_to_plot if curves_to_plot is not None else []
     y_label = new_curves_list[0][2] if new_curves_list and "Temps" not in new_curves_list[0][2] else (grandeur_physique_var.get() if grandeur_physique_var else "Grandeur")
@@ -278,12 +321,17 @@ def create_initial_plot_notebook(parent_frame):
                                           y_label=(grandeur_physique_var.get() if grandeur_physique_var else "Grandeur"))
     ALL_PLOT_WINDOWS.append(initial_window)
 
-# --- GESTION DES COURBES (masquer / supprimer / restaurer) ---
+# ---------------------------
+# Curve management functions
+# ---------------------------
+
 def remove_curve(window_data, idx):
     try:
         curve = window_data['curves_data'].pop(idx)
         if 'visible_flags' in window_data and idx < len(window_data['visible_flags']):
             window_data['visible_flags'].pop(idx)
+        if 'curve_colors' in window_data and idx < len(window_data['curve_colors']):
+            window_data['curve_colors'].pop(idx)
         window_data.setdefault('removed_curves', []).append(curve)
         if window_data['reticule'].active_curve_index >= len(window_data['curves_data']):
             window_data['reticule'].active_curve_index = 0
@@ -299,6 +347,7 @@ def restore_curve(window_data, removed_index):
         curve = removed.pop(removed_index)
         window_data['curves_data'].append(curve)
         _sync_visible_flags(window_data)
+        _sync_curve_colors(window_data)
         plot_mode_unique(window_data)
     except Exception as e:
         messagebox.showerror("Restauration", f"Impossible de restaurer la courbe: {e}")
@@ -379,7 +428,10 @@ def manage_curves_dialog(window_data=None):
     dlg.focus_force()
     dlg.wait_window()
 
-# --- TABLEAU DES DONNÉES (édition / export) ---
+# ---------------------------
+# Data table functions
+# ---------------------------
+
 def open_data_table():
     active_window = get_active_plot_window()
     if not active_window or not active_window['curves_data']:
@@ -529,7 +581,268 @@ def _show_data_table_for_curve(active_window, curve_index):
     tbl_win.focus_force()
     return
 
-# --- MODÉLISATION (fonctions mathématiques et ajustements) ---
+# ---------------------------
+# Calculation sheet (Feuille de calcul)
+# ---------------------------
+
+def open_calcul_sheet():
+    """Feuille de calcul pour créer nouvelles grandeurs à partir des courbes présentes."""
+    global CALCULATED_CURVES
+    active_window = get_active_plot_window()
+    if not active_window:
+        messagebox.showwarning("Erreur", "Veuillez d'abord effectuer une acquisition ou charger des données.")
+        return
+    available_data = {}
+    if active_window['curves_data']:
+        base_t_data = active_window['curves_data'][0][0]
+        available_data['t'] = (base_t_data, "s")
+    else:
+        messagebox.showwarning("Erreur", "Aucune donnée de base (Temps) trouvée dans l'onglet actif.")
+        return
+    base_time_length = len(available_data['t'][0])
+    for t_data, v_data, name, _ in active_window['curves_data']:
+        var_name = name.split('(')[0].strip().replace(' ', '_').replace('-', '_')
+        unit = name.split('(')[-1].replace(')', '').strip() if '(' in name else "V"
+        if len(v_data) == base_time_length:
+            if var_name not in available_data:
+                available_data[var_name] = (v_data, unit)
+            else:
+                i = 1
+                temp_name = var_name
+                while temp_name in available_data:
+                    i += 1
+                    temp_name = f"{var_name}_{i}"
+                available_data[temp_name] = (v_data, unit)
+    if not available_data or len(available_data) == 1:
+        messagebox.showwarning("Erreur", "Aucune grandeur mesurée/importée dans l'onglet actif pour effectuer des calculs.")
+        return
+    calcul_window = tk.Toplevel(root)
+    calcul_window.title("Feuille de calcul (Nouvelles Grandeurs)")
+    header_frame = ttk.Frame(calcul_window)
+    header_frame.pack(fill='x', padx=10, pady=5)
+    tk.Label(header_frame, text="Création de nouvelles grandeurs :", font='Helvetica 10 bold').pack(anchor='w')
+    vars_list_text = "Variables disponibles pour les formules (Nom = Donnée de la courbe) : \n"
+    for name, (data, unit) in available_data.items():
+        vars_list_text += f"  - {name} (Unité: {unit})\n"
+    tk.Label(header_frame, text=vars_list_text, justify=tk.LEFT, fg='darkgreen').pack(anchor='w')
+    tk.Label(header_frame, text="Utilisez les fonctions mathématiques Python/Numpy (ex: np.sin(t), np.exp(-U/tau), 2*I+3)").pack(anchor='w')
+    entry_frame = ttk.Frame(calcul_window)
+    entry_frame.pack(fill='x', padx=10, pady=10)
+    tk.Label(entry_frame, text="Nom de la nouvelle grandeur:").grid(row=0, column=0, sticky='w', padx=5)
+    new_name_var = tk.StringVar(value="Grandeur_Calculee")
+    tk.Entry(entry_frame, textvariable=new_name_var, width=30).grid(row=0, column=1, sticky='ew', padx=5)
+    tk.Label(entry_frame, text="Unité:").grid(row=1, column=0, sticky='w', padx=5)
+    new_unit_var = tk.StringVar(value="U.A.")
+    tk.Entry(entry_frame, textvariable=new_unit_var, width=10).grid(row=1, column=1, sticky='w', padx=5)
+    tk.Label(entry_frame, text="Formule:").grid(row=2, column=0, sticky='w', padx=5)
+    formula_var = tk.StringVar(value="")
+    entry_formula = tk.Entry(entry_frame, textvariable=formula_var, width=60)
+    entry_formula.grid(row=2, column=1, sticky='ew', padx=5, pady=5)
+
+    def calculate_and_plot():
+        name = new_name_var.get().strip()
+        unit = new_unit_var.get().strip()
+        formula = formula_var.get().strip()
+        if not name or not formula:
+            messagebox.showwarning("Erreur de calcul", "Veuillez fournir un nom et une formule.")
+            return
+        eval_env = {'np': np, 't': available_data['t'][0]}
+        for var_name, (data, unit_val) in available_data.items():
+            if var_name != 't':
+                eval_env[var_name] = data
+        try:
+            if re.search(r'\b(os|sys|file|exec|import|__)\b', formula):
+                raise ValueError("Fonctions Python interdites dans la formule pour des raisons de sécurité.")
+            result_array = eval(formula, {"__builtins__": None}, eval_env)
+            if not isinstance(result_array, np.ndarray) and isinstance(result_array, (int, float)):
+                result_array = np.full_like(available_data['t'][0], result_array)
+            if not isinstance(result_array, np.ndarray) or len(result_array) != len(available_data['t'][0]):
+                raise TypeError("Le résultat n'est pas un tableau de la même taille que les données originales.")
+            full_name = f"{name} ({unit})"
+            curves_to_plot = [(available_data['t'][0], result_array, full_name, False)]
+            open_new_plot_window_tab(curves_to_plot, title_suffix=f"(Calcul : {name})")
+            calcul_window.destroy()
+        except NameError as e:
+            messagebox.showerror("Erreur de Formule", f"Variable ou fonction non définie : {e}. Utilisez 'np.sin()' et les noms des grandeurs disponibles.")
+        except TypeError as e:
+            messagebox.showerror("Erreur de Calcul", f"Erreur de Type ou de Dimension: {e}. Vérifiez si votre formule est mathématiquement correcte.")
+        except Exception as e:
+            messagebox.showerror("Erreur Inattendue", f"Une erreur s'est produite lors du calcul: {e}")
+
+    tk.Button(entry_frame, text="Calculer et Afficher sur nouvel Onglet", command=calculate_and_plot, font='Helvetica 10 bold', bg='lightblue').grid(row=3, column=0, columnspan=2, pady=10)
+    calcul_window.update_idletasks()
+    width = calcul_window.winfo_width()
+    height = calcul_window.winfo_height()
+    x = (calcul_window.winfo_screenwidth() // 2) - (width // 2)
+    y = (calcul_window.winfo_screenheight() // 2) - (height // 2)
+    calcul_window.geometry(f'{width}x{height}+{x}+{y}')
+
+# ---------------------------
+# Import .ltp (LatisPro) via pycanum introspection
+# ---------------------------
+
+def menu_ouvrir_ltp():
+    """
+    Ouvre un fichier .ltp (LatisPro) :
+    - tente d'utiliser pycanum si une fonction existe pour lire .ltp
+    - sinon informe l'utilisateur et propose d'envoyer le fichier d'exemple
+    """
+    active_window = get_active_plot_window()
+    if active_window is None:
+        messagebox.showwarning("Ouvrir .ltp", "Aucun onglet actif pour recevoir les données.")
+        return
+
+    filepath = filedialog.askopenfilename(filetypes=[("Fichiers LatisPro", "*.ltp"), ("Tous fichiers", "*.*")],
+                                          title="Ouvrir un fichier LatisPro (.ltp)")
+    if not filepath:
+        return
+
+    # Liste de noms de fonctions plausibles dans pycanum ou ses sousmodules
+    candidate_names = [
+        'read_ltp', 'load_ltp', 'open_ltp',
+        'read_latis', 'load_latis', 'open_latis',
+        'import_ltp', 'latis_open', 'latis_load', 'read_latispro'
+    ]
+
+    tried = []
+    loader = None
+    # 1) essayer directement sur pycan module
+    for name in candidate_names:
+        if hasattr(pycan, name):
+            loader = getattr(pycan, name)
+            tried.append(f"pycan.{name}")
+            break
+    # 2) essayer sous-module pycan.latis si présent
+    if loader is None and hasattr(pycan, 'latis'):
+        latis_mod = getattr(pycan, 'latis')
+        for name in candidate_names:
+            if hasattr(latis_mod, name):
+                loader = getattr(latis_mod, name)
+                tried.append(f"pycan.latis.{name}")
+                break
+
+    # 3) si on n'a rien trouvé, chercher dans le module pour toute fonction contenant 'ltp' ou 'latis' dans le nom
+    if loader is None:
+        for attr in dir(pycan):
+            lname = attr.lower()
+            if 'ltp' in lname or 'latis' in lname:
+                candidate = getattr(pycan, attr)
+                if callable(candidate):
+                    loader = candidate
+                    tried.append(f"pycan.{attr}")
+                    break
+        if loader is None and hasattr(pycan, 'latis'):
+            for attr in dir(pycan.latis):
+                lname = attr.lower()
+                if 'ltp' in lname or 'latis' in lname:
+                    candidate = getattr(pycan.latis, attr)
+                    if callable(candidate):
+                        loader = candidate
+                        tried.append(f"pycan.latis.{attr}")
+                        break
+
+    if loader is None:
+        msg = ("Aucune fonction de lecture .ltp détectée dans pycanum sur cette installation.\n\n"
+               "Méthodes essayées: " + (", ".join(tried) if tried else "aucune") + "\n\n"
+               "Si vous disposez d'un exemple de fichier .ltp, joignez-le et je peux écrire un importeur spécifique.\n"
+               "Sinon vérifiez la documentation de pycanum pour la fonction d'import LatisPro.")
+        messagebox.showerror("Ouvrir .ltp", msg)
+        return
+
+    # tenter de charger avec la fonction trouvée
+    try:
+        data = loader(filepath)
+    except Exception as e:
+        messagebox.showerror("Ouvrir .ltp", f"Erreur lors de l'appel du loader {loader} : {e}")
+        return
+
+    # Interpréter plusieurs formats possibles de 'data' et ajouter des courbes dans l'onglet actif
+    curves_added = 0
+    try:
+        # cas 1 : dict avec 'time' et 'channels' ou 'times' et 'data'
+        if isinstance(data, dict):
+            if 'time' in data and 'channels' in data:
+                t = np.asarray(data['time'])
+                for ch_name, ch_values in data['channels'].items():
+                    v = np.asarray(ch_values)
+                    active_window['curves_data'].append((t, v, f"{ch_name} ({os.path.basename(filepath)})", True))
+                    curves_added += 1
+            elif 'times' in data and 'data' in data:
+                t = np.asarray(data['times'])
+                # data peut être dict de canaux ou tableau 2D
+                if isinstance(data['data'], dict):
+                    for ch_name, ch_values in data['data'].items():
+                        v = np.asarray(ch_values)
+                        active_window['curves_data'].append((t, v, f"{ch_name} ({os.path.basename(filepath)})", True))
+                        curves_added += 1
+                else:
+                    arr = np.asarray(data['data'])
+                    if arr.ndim == 1:
+                        active_window['curves_data'].append((t, arr, f"{os.path.basename(filepath)}", True))
+                        curves_added += 1
+                    elif arr.ndim == 2:
+                        # si shape (N, M) on suppose première colonne temps? sinon M canaux
+                        if arr.shape[1] == 2:
+                            active_window['curves_data'].append((arr[:,0], arr[:,1], f"{os.path.basename(filepath)}", True))
+                            curves_added += 1
+                        else:
+                            for i in range(arr.shape[1]):
+                                active_window['curves_data'].append((t, arr[:,i], f"{os.path.basename(filepath)}_ch{i}", True))
+                                curves_added += 1
+        # cas 2 : liste/tuple de courbes (t, v, name) ou liste de canaux
+        elif isinstance(data, (list, tuple)):
+            # element peut être (t,v) ou (t,v,name) ou juste array Nx2
+            for item in data:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    t = np.asarray(item[0])
+                    v = np.asarray(item[1])
+                    name = item[2] if len(item) >= 3 else os.path.basename(filepath)
+                    active_window['curves_data'].append((t, v, name, True))
+                    curves_added += 1
+                elif isinstance(item, np.ndarray):
+                    arr = np.asarray(item)
+                    if arr.ndim == 2 and arr.shape[1] >= 2:
+                        active_window['curves_data'].append((arr[:,0], arr[:,1], os.path.basename(filepath), True))
+                        curves_added += 1
+        # cas 3 : ndarray Nx2
+        elif isinstance(data, np.ndarray):
+            arr = data
+            if arr.ndim == 2 and arr.shape[1] >= 2:
+                active_window['curves_data'].append((arr[:,0], arr[:,1], os.path.basename(filepath), True))
+                curves_added += 1
+        else:
+            # format inconnu - tenter analyse si objet pandas DataFrame (si pd installé)
+            try:
+                import pandas as pd
+                if isinstance(data, pd.DataFrame):
+                    if 'time' in data.columns:
+                        t = data['time'].to_numpy()
+                        for col in data.columns:
+                            if col == 'time':
+                                continue
+                            v = data[col].to_numpy()
+                            active_window['curves_data'].append((t, v, f"{col} ({os.path.basename(filepath)})", True))
+                            curves_added += 1
+            except Exception:
+                pass
+    except Exception as e:
+        messagebox.showerror("Ouvrir .ltp", f"Erreur lors de l'interprétation des données : {e}")
+        return
+
+    if curves_added == 0:
+        messagebox.showwarning("Ouvrir .ltp", "Le fichier a été lu, mais aucun format de données reconnu n'a été trouvé. "
+                              "Résultat retourné par le loader :\n" + str(type(data)))
+        return
+
+    # afficher les nouvelles courbes
+    plot_mode_unique(active_window)
+    auto_calibrate_plot(active_window)
+    messagebox.showinfo("Ouvrir .ltp", f"{curves_added} courbe(s) importée(s) depuis {os.path.basename(filepath)}")
+
+# ---------------------------
+# Modelling functions
+# ---------------------------
+
 def f_lineaire(x, a):
     return a * x
 
@@ -687,7 +1000,10 @@ def modeliser_puissance():
     except Exception as e:
         messagebox.showerror("Erreur Modélisation Pui.", f"Erreur: {e}")
 
-# --- CALCULER DERIVEE (doit exister avant setup_main_window) ---
+# ---------------------------
+# Derivative
+# ---------------------------
+
 def calculer_derivee():
     active_window = get_active_plot_window()
     if not active_window or not active_window['curves_data']:
@@ -710,99 +1026,341 @@ def calculer_derivee():
     plot_mode_unique(active_window)
     auto_calibrate_plot(active_window)
 
-# --- FEUILLE DE CALCUL (déjà définie ci-dessus pour appel depuis menu) ---
-def open_calcul_sheet():
-    global CALCULATED_CURVES
-    active_window = get_active_plot_window()
-    if not active_window:
-        messagebox.showwarning("Erreur", "Veuillez d'abord effectuer une acquisition ou charger des données.")
-        return
-    available_data = {}
-    if active_window['curves_data']:
-        base_t_data = active_window['curves_data'][0][0]
-        available_data['t'] = (base_t_data, "s")
-    else:
-        messagebox.showwarning("Erreur", "Aucune donnée de base (Temps) trouvée dans l'onglet actif.")
-        return
-    base_time_length = len(available_data['t'][0])
-    for t_data, v_data, name, _ in active_window['curves_data']:
-        var_name = name.split('(')[0].strip().replace(' ', '_').replace('-', '_')
-        unit = name.split('(')[-1].replace(')', '').strip() if '(' in name else "V"
-        if len(v_data) == base_time_length:
-            if var_name not in available_data:
-                available_data[var_name] = (v_data, unit)
-            else:
-                i = 1
-                temp_name = var_name
-                while temp_name in available_data:
-                    i += 1
-                    temp_name = f"{var_name}_{i}"
-                available_data[temp_name] = (v_data, unit)
-    if not available_data or len(available_data) == 1:
-        messagebox.showwarning("Erreur", "Aucune grandeur mesurée/importée dans l'onglet actif pour effectuer des calculs.")
-        return
-    calcul_window = tk.Toplevel(root)
-    calcul_window.title("Feuille de calcul (Nouvelles Grandeurs)")
-    header_frame = ttk.Frame(calcul_window)
-    header_frame.pack(fill='x', padx=10, pady=5)
-    tk.Label(header_frame, text="Création de nouvelles grandeurs :", font='Helvetica 10 bold').pack(anchor='w')
-    vars_list_text = "Variables disponibles pour les formules (Nom = Donnée de la courbe) : \n"
-    for name, (data, unit) in available_data.items():
-        vars_list_text += f"  - {name} (Unité: {unit})\n"
-    tk.Label(header_frame, text=vars_list_text, justify=tk.LEFT, fg='darkgreen').pack(anchor='w')
-    tk.Label(header_frame, text="Utilisez les fonctions mathématiques Python/Numpy (ex: np.sin(t), np.exp(-U/tau), 2*I+3)").pack(anchor='w')
-    entry_frame = ttk.Frame(calcul_window)
-    entry_frame.pack(fill='x', padx=10, pady=10)
-    tk.Label(entry_frame, text="Nom de la nouvelle grandeur:").grid(row=0, column=0, sticky='w', padx=5)
-    new_name_var = tk.StringVar(value="Grandeur_Calculee")
-    tk.Entry(entry_frame, textvariable=new_name_var, width=30).grid(row=0, column=1, sticky='ew', padx=5)
-    tk.Label(entry_frame, text="Unité:").grid(row=1, column=0, sticky='w', padx=5)
-    new_unit_var = tk.StringVar(value="U.A.")
-    tk.Entry(entry_frame, textvariable=new_unit_var, width=10).grid(row=1, column=1, sticky='w', padx=5)
-    tk.Label(entry_frame, text="Formule:").grid(row=2, column=0, sticky='w', padx=5)
-    formula_var = tk.StringVar(value="")
-    entry_formula = tk.Entry(entry_frame, textvariable=formula_var, width=60)
-    entry_formula.grid(row=2, column=1, sticky='ew', padx=5, pady=5)
+# ---------------------------
+# Automatic measurements (period, frequency, min/max)
+# ---------------------------
 
-    def calculate_and_plot():
-        name = new_name_var.get().strip()
-        unit = new_unit_var.get().strip()
-        formula = formula_var.get().strip()
-        if not name or not formula:
-            messagebox.showwarning("Erreur de calcul", "Veuillez fournir un nom et une formule.")
-            return
-        eval_env = {'np': np, 't': available_data['t'][0]}
-        for var_name, (data, unit_val) in available_data.items():
-            if var_name != 't':
-                eval_env[var_name] = data
+def _compute_period_from_peaks(t, v):
+    """Estimate period by detecting local maxima / crossings."""
+    if len(t) < 3:
+        return None, None, []
+    v = np.asarray(v)
+    t = np.asarray(t)
+    vmin, vmax = np.min(v), np.max(v)
+    amplitude = vmax - vmin
+    if amplitude == 0:
+        return None, None, []
+    threshold = vmin + 0.2 * amplitude
+    peaks_idx = []
+    for i in range(1, len(v) - 1):
+        if v[i] > v[i - 1] and v[i] > v[i + 1] and v[i] >= threshold:
+            peaks_idx.append(i)
+    peak_times = t[peaks_idx] if peaks_idx else np.array([])
+
+    if len(peak_times) < 2:
+        mean_v = np.mean(v)
+        crossings = []
+        for i in range(len(v) - 1):
+            if v[i] < mean_v and v[i + 1] >= mean_v:
+                dv = v[i + 1] - v[i]
+                if dv == 0:
+                    tc = t[i]
+                else:
+                    frac = (mean_v - v[i]) / dv
+                    tc = t[i] + frac * (t[i + 1] - t[i])
+                crossings.append(tc)
+        peak_times = np.array(crossings)
+
+    if len(peak_times) < 2:
+        return None, None, []
+
+    diffs = np.diff(peak_times)
+    med = np.median(diffs)
+    if med <= 0:
+        return None, None, peak_times.tolist()
+    diffs_good = diffs[diffs < 10 * med]
+    if len(diffs_good) == 0:
+        return None, None, peak_times.tolist()
+    period_mean = float(np.mean(diffs_good))
+    period_std = float(np.std(diffs_good))
+    return period_mean, period_std, peak_times.tolist()
+
+def measure_on_curve(active_window, curve_index, t0=None, t1=None, show_peaks_on_plot=False):
+    """Compute measurements for one curve within optional time window."""
+    try:
+        t_arr, v_arr, name, is_raw = active_window['curves_data'][curve_index]
+    except Exception as e:
+        raise RuntimeError(f"Impossible de récupérer la courbe : {e}")
+
+    if not hasattr(t_arr, '__len__') or len(t_arr) == 0:
+        raise RuntimeError("La courbe sélectionnée ne contient pas de données temporelles.")
+
+    t = np.asarray(t_arr)
+    v = np.asarray(v_arr)
+
+    if t0 is not None or t1 is not None:
+        # apply window
+        mask = np.ones_like(t, dtype=bool)
+        if t0 is not None:
+            mask &= (t >= t0)
+        if t1 is not None:
+            mask &= (t <= t1)
+        if np.sum(mask) < 2:
+            raise RuntimeError("La plage temporelle sélectionnée contient trop peu de points.")
+        t = t[mask]
+        v = v[mask]
+
+    vmin = float(np.min(v))
+    vmax = float(np.max(v))
+
+    period_mean, period_std, peak_times = _compute_period_from_peaks(t, v)
+    frequency = None
+    if period_mean is not None and period_mean > 0:
+        frequency = 1.0 / period_mean
+
+    measurements = {
+        'curve_name': name,
+        'T_mean_s': period_mean,
+        'T_std_s': period_std,
+        'f_Hz': frequency,
+        'v_min': vmin,
+        'v_max': vmax,
+        'n_peaks': len(peak_times),
+        'peak_times': peak_times
+    }
+
+    if show_peaks_on_plot and peak_times:
         try:
-            if re.search(r'\b(os|sys|file|exec|import|__)\b', formula):
-                raise ValueError("Fonctions Python interdites dans la formule pour des raisons de sécurité.")
-            result_array = eval(formula, {"__builtins__": None}, eval_env)
-            if not isinstance(result_array, np.ndarray) and isinstance(result_array, (int, float)):
-                result_array = np.full_like(available_data['t'][0], result_array)
-            if not isinstance(result_array, np.ndarray) or len(result_array) != len(available_data['t'][0]):
-                raise TypeError("Le résultat n'est pas un tableau de la même taille que les données originales.")
-            full_name = f"{name} ({unit})"
-            curves_to_plot = [(available_data['t'][0], result_array, full_name, False)]
-            open_new_plot_window_tab(curves_to_plot, title_suffix=f"(Calcul : {name})")
-            calcul_window.destroy()
-        except NameError as e:
-            messagebox.showerror("Erreur de Formule", f"Variable ou fonction non définie : {e}. Utilisez 'np.sin()' et les noms des grandeurs disponibles.")
-        except TypeError as e:
-            messagebox.showerror("Erreur de Calcul", f"Erreur de Type ou de Dimension: {e}. Vérifiez si votre formule est mathématiquement correcte.")
+            ax = active_window['ax']
+            peak_vals = np.interp(np.array(peak_times), np.asarray(t_arr), np.asarray(v_arr))
+            ax.scatter(peak_times, peak_vals, c='magenta', marker='x', zorder=10)
+            active_window['canvas'].draw_idle()
+        except Exception:
+            pass
+
+    return measurements
+
+def measure_auto_dialog():
+    """Dialog to choose curve and optional time window, then show measurements."""
+    active_window = get_active_plot_window()
+    if not active_window or not active_window['curves_data']:
+        messagebox.showwarning("Mesures automatiques", "Aucune courbe disponible dans l'onglet actif.")
+        return
+
+    selected = select_curve_dialog(active_window, title="Sélection de la courbe pour mesures automatiques")
+    if selected is None:
+        return
+    curve_index, t_arr, v_arr, name, is_raw = selected
+
+    # default window = full range
+    t_min = float(np.min(t_arr)) if len(t_arr) else 0.0
+    t_max = float(np.max(t_arr)) if len(t_arr) else 0.0
+
+    dlg = tk.Toplevel(root)
+    dlg.title(f"Mesures automatiques - {name}")
+    dlg.geometry("460x300")
+    dlg.transient(root)
+
+    frm = ttk.Frame(dlg, padding=10)
+    frm.pack(fill='both', expand=True)
+
+    tk.Label(frm, text=f"Courbe : {name}", font=('Helvetica', 11, 'bold')).pack(anchor='w', pady=(0,6))
+
+    # time window entries
+    tw_frame = ttk.LabelFrame(frm, text="Plage temporelle pour l'analyse (laisser vide = totalité)")
+    tw_frame.pack(fill='x', pady=6)
+    tk.Label(tw_frame, text="T0 (s):").grid(row=0, column=0, sticky='w', padx=4, pady=2)
+    t0_var = tk.StringVar(value=f"{t_min:.6g}")
+    e_t0 = tk.Entry(tw_frame, textvariable=t0_var, width=18)
+    e_t0.grid(row=0, column=1, padx=4, pady=2)
+    tk.Label(tw_frame, text="T1 (s):").grid(row=1, column=0, sticky='w', padx=4, pady=2)
+    t1_var = tk.StringVar(value=f"{t_max:.6g}")
+    e_t1 = tk.Entry(tw_frame, textvariable=t1_var, width=18)
+    e_t1.grid(row=1, column=1, padx=4, pady=2)
+
+    # placeholder for results
+    res_frame = ttk.Frame(frm)
+    res_frame.pack(fill='both', expand=True, pady=(8,0))
+
+    results_text = tk.Text(res_frame, height=8, wrap=tk.WORD)
+    results_text.pack(fill='both', expand=True)
+
+    show_peaks_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(frm, text="Afficher les pics détectés sur le graphique", variable=show_peaks_var).pack(anchor='w', pady=6)
+
+    def run_measure():
+        # parse t0/t1
+        t0 = None
+        t1 = None
+        try:
+            t0s = t0_var.get().strip()
+            t1s = t1_var.get().strip()
+            if t0s != '':
+                t0 = float(t0s.replace(',', '.'))
+            if t1s != '':
+                t1 = float(t1s.replace(',', '.'))
+        except Exception:
+            messagebox.showwarning("Plage temporelle", "Plage temporelle non valide.")
+            return
+        try:
+            meas = measure_on_curve(active_window, curve_index, t0=t0, t1=t1, show_peaks_on_plot=False)
         except Exception as e:
-            messagebox.showerror("Erreur Inattendue", f"Une erreur s'est produite lors du calcul: {e}")
+            messagebox.showerror("Mesures automatiques", f"Erreur lors du calcul des mesures : {e}")
+            return
+        results_text.delete('1.0', tk.END)
+        results_text.insert(tk.END, f"Points détectés (pics) : {meas.get('n_peaks', 0)}\n")
+        results_text.insert(tk.END, f"Valeur maximale : {meas['v_max']:.6g}\n")
+        results_text.insert(tk.END, f"Valeur minimale : {meas['v_min']:.6g}\n")
+        T = meas.get('T_mean_s')
+        Tstd = meas.get('T_std_s')
+        fval = meas.get('f_Hz')
+        if T is not None:
+            results_text.insert(tk.END, f"Période (moyenne) T = {T:.6g} s    (écart-type {Tstd:.2g} s)\n")
+        else:
+            results_text.insert(tk.END, "Période (moyenne) T : non déterminée\n")
+        if fval is not None:
+            results_text.insert(tk.END, f"Fréquence f = {fval:.6g} Hz\n")
+        else:
+            results_text.insert(tk.END, "Fréquence f : non déterminée\n")
 
-    tk.Button(entry_frame, text="Calculer et Afficher sur nouvel Onglet", command=calculate_and_plot, font='Helvetica 10 bold', bg='lightblue').grid(row=3, column=0, columnspan=2, pady=10)
-    calcul_window.update_idletasks()
-    width = calcul_window.winfo_width()
-    height = calcul_window.winfo_height()
-    x = (calcul_window.winfo_screenwidth() // 2) - (width // 2)
-    y = (calcul_window.winfo_screenheight() // 2) - (height // 2)
-    calcul_window.geometry(f'{width}x{height}+{x}+{y}')
+    def apply_and_close():
+        # apply show peaks if requested
+        t0 = None
+        t1 = None
+        try:
+            t0s = t0_var.get().strip()
+            t1s = t1_var.get().strip()
+            if t0s != '':
+                t0 = float(t0s.replace(',', '.'))
+            if t1s != '':
+                t1 = float(t1s.replace(',', '.'))
+        except Exception:
+            t0 = t1 = None
+        if show_peaks_var.get():
+            try:
+                measure_on_curve(active_window, curve_index, t0=t0, t1=t1, show_peaks_on_plot=True)
+            except Exception:
+                pass
+        dlg.destroy()
 
-# --- AFFICHAGE / CALIBRAGE (plot_mode_unique, auto_calibrate_plot, de_calibrate_plot) ---
+    btns = ttk.Frame(frm)
+    btns.pack(fill='x', pady=6)
+    ttk.Button(btns, text="Calculer", command=run_measure).pack(side='left', padx=4)
+    ttk.Button(btns, text="Appliquer (Afficher pics si coché)", command=apply_and_close).pack(side='left', padx=4)
+    ttk.Button(btns, text="Fermer", command=dlg.destroy).pack(side='right', padx=4)
+
+    dlg.grab_set()
+    dlg.focus_force()
+    dlg.wait_window()
+
+# ---------------------------
+# FFT (Fourier spectrum)
+# ---------------------------
+
+def compute_fft_for_curve(t, v):
+    """Compute single-sided FFT amplitude and frequency vector. Returns freqs, amplitude."""
+    t = np.asarray(t)
+    v = np.asarray(v)
+    if len(t) < 2:
+        return np.array([]), np.array([])
+    dt = np.diff(t)
+    if np.any(dt <= 0):
+        order = np.argsort(t)
+        t = t[order]
+        v = v[order]
+        dt = np.diff(t)
+    fe = 1.0 / np.mean(dt)
+    N = len(v)
+    v0 = v - np.mean(v)
+    window = np.hanning(N)
+    vw = v0 * window
+    Vf = np.fft.rfft(vw)
+    amplitude = (2.0 / np.sum(window)) * np.abs(Vf)
+    freqs = np.fft.rfftfreq(N, d=1.0/fe)
+    return freqs, amplitude
+
+def fft_dialog():
+    """Dialog: choose curve, optional time window, compute FFT and open new tab with spectrum."""
+    active_window = get_active_plot_window()
+    if not active_window or not active_window['curves_data']:
+        messagebox.showwarning("FFT", "Aucune courbe disponible dans l'onglet actif.")
+        return
+
+    selected = select_curve_dialog(active_window, title="Sélection de la courbe pour FFT")
+    if selected is None:
+        return
+    curve_index, t_arr, v_arr, name, is_raw = selected
+
+    t_min = float(np.min(t_arr)) if len(t_arr) else 0.0
+    t_max = float(np.max(t_arr)) if len(t_arr) else 0.0
+
+    dlg = tk.Toplevel(root)
+    dlg.title(f"Spectre de Fourier - {name}")
+    dlg.geometry("420x240")
+    dlg.transient(root)
+
+    frm = ttk.Frame(dlg, padding=10)
+    frm.pack(fill='both', expand=True)
+
+    tk.Label(frm, text=f"Courbe : {name}", font=('Helvetica', 11, 'bold')).pack(anchor='w', pady=(0,6))
+
+    # time window
+    tw_frame = ttk.Frame(frm)
+    tw_frame.pack(fill='x', pady=4)
+    tk.Label(tw_frame, text="T0 (s):").grid(row=0, column=0, sticky='w', padx=4, pady=2)
+    t0_var = tk.StringVar(value=f"{t_min:.6g}")
+    tk.Entry(tw_frame, textvariable=t0_var, width=18).grid(row=0, column=1, padx=4, pady=2)
+    tk.Label(tw_frame, text="T1 (s):").grid(row=1, column=0, sticky='w', padx=4, pady=2)
+    t1_var = tk.StringVar(value=f"{t_max:.6g}")
+    tk.Entry(tw_frame, textvariable=t1_var, width=18).grid(row=1, column=1, padx=4, pady=2)
+
+    result_label = tk.StringVar(value="")
+    tk.Label(frm, textvariable=result_label, foreground='blue').pack(anchor='w', pady=6)
+
+    def run_fft_and_show():
+        # parse t0/t1
+        t0 = None
+        t1 = None
+        try:
+            t0s = t0_var.get().strip()
+            t1s = t1_var.get().strip()
+            if t0s != '':
+                t0 = float(t0s.replace(',', '.'))
+            if t1s != '':
+                t1 = float(t1s.replace(',', '.'))
+        except Exception:
+            messagebox.showwarning("Plage temporelle", "Plage temporelle non valide.")
+            return
+
+        t = np.asarray(t_arr)
+        v = np.asarray(v_arr)
+        if t0 is not None or t1 is not None:
+            mask = np.ones_like(t, dtype=bool)
+            if t0 is not None:
+                mask &= (t >= t0)
+            if t1 is not None:
+                mask &= (t <= t1)
+            if np.sum(mask) < 2:
+                messagebox.showwarning("FFT", "La plage temporelle contient trop peu de points.")
+                return
+            t = t[mask]
+            v = v[mask]
+
+        freqs, amp = compute_fft_for_curve(t, v)
+        if freqs.size == 0:
+            messagebox.showwarning("FFT", "Impossible de calculer la FFT (données insuffisantes).")
+            return
+
+        idx_max = np.argmax(amp)
+        peak_freq = freqs[idx_max]
+        peak_amp = amp[idx_max]
+        result_label.set(f"Pic dominant: f = {peak_freq:.6g} Hz, amplitude = {peak_amp:.6g}")
+
+        spec_name = f"Spectre FFT de {name}"
+        open_new_plot_window_tab([(freqs, amp, spec_name, False)], title_suffix="(FFT)")
+        dlg.destroy()
+
+    ttk.Button(frm, text="Calculer et Afficher le Spectre", command=run_fft_and_show).pack(side='left', padx=6, pady=8)
+    ttk.Button(frm, text="Fermer", command=dlg.destroy).pack(side='right', padx=6, pady=8)
+
+    dlg.grab_set()
+    dlg.focus_force()
+    dlg.wait_window()
+
+# ---------------------------
+# Plot update and autoscale
+# ---------------------------
+
 def auto_calibrate_plot(window_data=None):
     global CALIBRE_AFFICHE
     if window_data is None:
@@ -834,6 +1392,7 @@ def auto_calibrate_plot(window_data=None):
     else:
         x_min, x_max = window_data['_initial_x_limits']
     ax.set_xlim(x_min, x_max)
+
     visible_flags = window_data.get('visible_flags', [])
     main_vs = []
     for i, (t, v, nom, _) in enumerate(curves_data):
@@ -863,6 +1422,7 @@ def auto_calibrate_plot(window_data=None):
     else:
         y_min, y_max = window_data['_initial_y_limits']
     ax.set_ylim(y_min, y_max)
+
     secax = window_data.get('secax')
     if secax is not None:
         sec_vs = []
@@ -907,6 +1467,10 @@ def de_calibrate_plot(window_data=None):
     window_data['_previous_y_limits'] = window_data['_initial_y_limits']
     window_data['canvas'].draw_idle()
 
+# ---------------------------
+# Plot rendering
+# ---------------------------
+
 def update_plot_label(event=None):
     for window in ALL_PLOT_WINDOWS:
         if window.get('ax') and window.get('canvas'):
@@ -915,7 +1479,19 @@ def update_plot_label(event=None):
                     window['ax'].set_ylabel(grandeur_physique_var.get())
                 window['canvas'].draw_idle()
 
+def update_plot_style(style=None, window_data=None):
+    """Change global style or a specific window style (simple hook)."""
+    if style and plot_style_var:
+        plot_style_var.set(style)
+    if window_data:
+        plot_mode_unique(window_data)
+    else:
+        w = get_active_plot_window()
+        if w:
+            plot_mode_unique(w)
+
 def plot_mode_unique(window_data=None):
+    """Draw curves for a given window (handles secondary axis and colors)."""
     global CALIBRE_AFFICHE
     if window_data is None:
         window_data = get_active_plot_window()
@@ -926,6 +1502,7 @@ def plot_mode_unique(window_data=None):
     curves_data = window_data['curves_data']
     reticule = window_data['reticule']
 
+    # remove old secondary if present
     if window_data.get('secax') is not None:
         try:
             old = window_data['secax']
@@ -935,7 +1512,10 @@ def plot_mode_unique(window_data=None):
             pass
 
     _sync_visible_flags(window_data)
+    _sync_curve_colors(window_data)
     visible_flags = window_data.get('visible_flags', [])
+    curve_colors = window_data.get('curve_colors', [])
+
     plot_style = plot_style_var.get() if plot_style_var else Config.PLOT_STYLE
 
     current_x_lim = ax.get_xlim()
@@ -1046,13 +1626,19 @@ def plot_mode_unique(window_data=None):
                 continue
             default_color = plt.cm.viridis(i / max(1, len(curves_data)))
             target_ax = secax if (secax is not None and i in secondary_indices) else ax
-            if target_ax is secax:
-                linecolor = sec_color
+
+            # use user color override if present
+            if i < len(curve_colors) and curve_colors[i] is not None:
+                linecolor = curve_colors[i]
             else:
-                if not is_raw:
-                    linecolor = 'red' if 'Modèle' in nom else ('blue' if 'Dérivée' in nom or 'Calcul' in nom else default_color)
+                if target_ax is secax:
+                    linecolor = sec_color
                 else:
-                    linecolor = default_color
+                    if not is_raw:
+                        linecolor = 'red' if 'Modèle' in nom else ('blue' if 'Dérivée' in nom or 'Calcul' in nom else default_color)
+                    else:
+                        linecolor = default_color
+
             if not is_raw:
                 linestyle = '--'
                 target_ax.plot(t, v, label=nom, color=linecolor, linestyle=linestyle, linewidth=2)
@@ -1072,7 +1658,10 @@ def plot_mode_unique(window_data=None):
 
     canvas.draw_idle()
 
-# --- MODE PERMANENT (Oscilloscope) ---
+# ---------------------------
+# Mode permanent / oscillo
+# ---------------------------
+
 def plot_mode_permanent():
     messagebox.showwarning("Attention", "Le mode Permanent (Oscilloscope) n'est pas adapté à la gestion par onglets et s'ouvrira dans une fenêtre séparée.")
     global sysam_interface, CALIBRE_AFFICHE
@@ -1126,7 +1715,10 @@ def update_oscillo(frame, sys_interface, ax, line):
             ax.set_xlim(temps_oscillo[0], temps_oscillo[-1])
     return line,
 
-# --- ACQUISITION & AFFICHAGE PRINCIPAL ---
+# ---------------------------
+# Acquisition / exports
+# ---------------------------
+
 def start_acquisition_and_plot(event=None):
     global sysam_interface, CALIBRE_AFFICHE, root
     active_window = get_active_plot_window()
@@ -1205,7 +1797,6 @@ def start_acquisition_and_plot(event=None):
                 pass
             sysam_interface = None
 
-# --- EXPORT CSV ---
 def exporter_csv():
     active_window = get_active_plot_window()
     if not active_window or not active_window['curves_data']:
@@ -1237,30 +1828,43 @@ def exporter_csv():
     except Exception as e:
         messagebox.showerror("Erreur d'exportation", f"Impossible d'exporter les données: {e}")
 
-# --- MENUS / HELP / DIVERS ---
-def menu_enregistrer():
-    messagebox.showinfo("Fonctionnalité", "La fonction Enregistrer (Fichier) sera implémentée ici.")
+# ---------------------------
+# Options: rename / recolor curves
+# ---------------------------
 
-def menu_copier():
-    messagebox.showinfo("Fonctionnalité", "La fonction Copier (Édition) sera implémentée ici.")
+def rename_curve_dialog():
+    active_window = get_active_plot_window()
+    if not active_window or not active_window['curves_data']:
+        messagebox.showwarning("Renommer la courbe", "Aucune courbe disponible.")
+        return
+    selected = select_curve_dialog(active_window, title="Sélectionnez la courbe à renommer")
+    if selected is None:
+        return
+    idx, t, v, name, is_raw = selected
+    new_name = simpledialog.askstring("Renommer", f"Nom actuel : {name}\nNouveau nom :")
+    if new_name and new_name.strip():
+        active_window['curves_data'][idx] = (t, v, new_name.strip(), is_raw)
+        plot_mode_unique(active_window)
 
-def show_about_info():
-    info = ("Projet d'acquisition Sysam SP5 - Alternative Libre LatisPro\n\n"
-            "Auteur : Mathias Laroche - Lycée Lafayette Clermont Ferrand\n"
-            "Contact : mathias.laroche@ac-clermont.fr\n\n"
-            "Projet réalisé avec les outils GNU/Linux, Python 3\nLicence : GPL")
-    messagebox.showinfo("À propos", info)
+def recolor_curve_dialog():
+    active_window = get_active_plot_window()
+    if not active_window or not active_window['curves_data']:
+        messagebox.showwarning("Recolorer la courbe", "Aucune courbe disponible.")
+        return
+    selected = select_curve_dialog(active_window, title="Sélectionnez la courbe à recolorer")
+    if selected is None:
+        return
+    idx, _, _, name, _ = selected
+    color = colorchooser.askcolor(title=f"Choisir couleur pour {name}")
+    if color and color[1]:
+        _sync_curve_colors(active_window)
+        active_window['curve_colors'][idx] = color[1]
+        plot_mode_unique(active_window)
 
-def show_help_file():
-    help_content = "Guide d'utilisation intégré. Voir les menus pour les outils disponibles."
-    help_window = tk.Toplevel(root)
-    help_window.title("Aide du programme - Fonctionnalités")
-    text_widget = tk.Text(help_window, wrap=tk.WORD, padx=15, pady=15, font=('Consolas', 10), bg='#f8f8f8')
-    text_widget.pack(expand=True, fill='both')
-    text_widget.insert(tk.END, help_content)
-    text_widget.config(state=tk.DISABLED)
+# ---------------------------
+# Selection dialogs
+# ---------------------------
 
-# --- DIALOGS UTILITAIRES (sélection de courbe) ---
 def select_curve_dialog(active_window, title="Sélection de la courbe"):
     curves_list = active_window['curves_data']
     if not curves_list:
@@ -1324,7 +1928,10 @@ def select_reticule_curve(window_data=None):
     listbox.bind('<Double-1>', lambda event: on_select())
     root.wait_window(selection_window)
 
-# --- FENETRE PRINCIPALE / MENU ---
+# ---------------------------
+# Main window & menus
+# ---------------------------
+
 def update_fe_and_xaxis(event=None):
     global ALL_PLOT_WINDOWS
     try:
@@ -1494,22 +2101,27 @@ def setup_main_window():
     pre_trig_var = tk.StringVar(value=str(Config.PRE_TRIG))
     plot_style_var = tk.StringVar(value=Config.PLOT_STYLE)
 
-    # BARRE DE MENU
+    # Menu bar
     menubar = tk.Menu(root)
     root.config(menu=menubar)
+
+    # Fichier
     file_menu = tk.Menu(menubar, tearoff=0)
     menubar.add_cascade(label="Fichier", menu=file_menu)
     file_menu.add_command(label="Nouveau", command=menu_nouveau)
     file_menu.add_command(label="Ouvrir...", command=menu_ouvrir)
+    file_menu.add_command(label="Ouvrir (.ltp)...", command=menu_ouvrir_ltp)
     file_menu.add_command(label="Enregistrer...", command=menu_enregistrer)
     file_menu.add_command(label="Exporter (CSV)...", command=exporter_csv)
     file_menu.add_separator()
     file_menu.add_command(label="Quitter", command=close_program)
 
+    # Edition
     edit_menu = tk.Menu(menubar, tearoff=0)
     menubar.add_cascade(label="Édition", menu=edit_menu)
     edit_menu.add_command(label="Copier", command=menu_copier)
 
+    # Outils
     tools_menu = tk.Menu(menubar, tearoff=0)
     menubar.add_cascade(label="Outils", menu=tools_menu)
     tools_menu.add_command(label="Nouvelle fenêtre graphique (Onglet)", command=open_new_plot_window_tab)
@@ -1517,8 +2129,11 @@ def setup_main_window():
     tools_menu.add_command(label="Feuille de calcul (Nouvelles Grandeurs)", command=open_calcul_sheet)
     tools_menu.add_separator()
     tools_menu.add_command(label="Calculer dérivée (dY/dt)", command=calculer_derivee)
+    tools_menu.add_command(label="Mesures automatiques (T, f, Vmax, Vmin)", command=measure_auto_dialog)
+    tools_menu.add_command(label="Spectre de Fourier (FFT)", command=fft_dialog)
     tools_menu.add_command(label="Gérer les courbes...", command=lambda: manage_curves_dialog(get_active_plot_window()))
 
+    # Modélisation submenu
     model_menu = tk.Menu(tools_menu, tearoff=0)
     tools_menu.add_cascade(label="Modélisation", menu=model_menu)
     model_menu.add_command(label="Linéaire (y = ax)", command=modeliser_lineaire)
@@ -1526,26 +2141,31 @@ def setup_main_window():
     model_menu.add_command(label="Exponentielle (y = A·exp(-t/τ) + C)", command=modeliser_exponentielle)
     model_menu.add_command(label="Puissance (y = A·tⁿ + B)", command=modeliser_puissance)
 
+    # Options menu
     options_menu = tk.Menu(menubar, tearoff=0)
     menubar.add_cascade(label="Options", menu=options_menu)
     options_menu.add_command(label="Calibrage Auto (Optimiser l'Affichage)", command=lambda: auto_calibrate_plot())
     options_menu.add_command(label="Décalibrer (Retour affichage initial)", command=lambda: de_calibrate_plot())
     options_menu.add_command(label="Réticule lié à la courbe...", command=lambda: select_reticule_curve())
     options_menu.add_separator()
-
+    # rename / recolor
+    options_menu.add_command(label="Renommer la courbe...", command=rename_curve_dialog)
+    options_menu.add_command(label="Recolorer la courbe...", command=recolor_curve_dialog)
+    options_menu.add_separator()
     display_style_menu = tk.Menu(options_menu, tearoff=0)
     options_menu.add_cascade(label="Style d'Affichage", menu=display_style_menu)
     style_options = ["Points", "Courbe seule", "Points + Courbe"]
     for style in style_options:
         display_style_menu.add_radiobutton(label=style, command=lambda s=style: update_plot_style(style=s))
 
+    # Help
     help_menu = tk.Menu(menubar, tearoff=0)
     menubar.add_cascade(label="Aide", menu=help_menu)
-    help_menu.add_command(label="Fichier d'aide (Fonctionnalités)", command=show_help_file)
+    help_menu.add_command(label="Fichier d'aide (Fonctionnalités)", command=lambda: messagebox.showinfo("Aide", "Voir la documentation intégrée."))
     help_menu.add_separator()
-    help_menu.add_command(label="À propos", command=show_about_info)
+    help_menu.add_command(label="À propos", command=lambda: messagebox.showinfo("À propos", "Sysam SP5 Acquisition - LatisLibre"))
 
-    # CADRE PRINCIPAL
+    # Main UI layout: controls (left) + plot notebook (right)
     main_frame = tk.Frame(root)
     main_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -1651,7 +2271,7 @@ def setup_main_window():
     update_trigger_fields()
     tk.Button(control_frame, text="Démarrer l'Acquisition (ou F10)", command=start_acquisition_and_plot, font='Helvetica 12 bold', pady=5).grid(row=row_idx, column=0, columnspan=2, pady=10)
 
-    # CADRE PLOT (droite)
+    # Plot area on the right
     plot_frame_container = tk.Frame(main_frame, bd=2, relief=tk.SUNKEN)
     plot_frame_container.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=10)
     create_initial_plot_notebook(plot_frame_container)
@@ -1665,6 +2285,10 @@ def setup_main_window():
             pass
 
     root.mainloop()
+
+# ---------------------------
+# Entry point
+# ---------------------------
 
 if __name__ == "__main__":
     setup_main_window()
