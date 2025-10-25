@@ -1,16 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Sysam SP5 Acquisition - Version16
+Sysam SP5 Acquisition - Version17
 
-Modifications principales (par rapport à la v15) :
-- Suppression de la fonctionnalité du chronomètre d'acquisition.
-- Implémentation de la fonction "Copier" dans le menu Édition : copie au presse-papiers
-  des données (temps;valeur) de la courbe active (ou de la première courbe si une seule).
-- Ajout dans le menu Fichier d'une commande "Imprimer la courbe..." qui exporte la
-  courbe active en PNG temporaire puis envoie le fichier à l'imprimante (commande
-  dépendante du système : Windows -> startfile(..., "print"), Unix -> lpr).
-- Divers nettoyages mineurs et renumérotation de version à 16.
-- Le reste des fonctionnalités (acquisition, affichage, feuille de calcul, export CSV, dérivée, FFT, modèles, etc.) est inchangé.
+Modifications principales (par rapport aux versions précédentes) :
+- Correction du binding F10 (évite NameError si le handler est défini après la création de la fenêtre).
+- Implémentation améliorée de l'impression (choix d'imprimante, ouverture des paramètres et impression
+  de toutes les courbes visibles de l'onglet actif) en mode "best-effort" multi-plateforme.
+- Fonction "Copier" implémentée (copie la courbe active au presse-papiers en CSV ; menu Édition).
+- Divers nettoyages mineurs.
 """
 import pycanum.main as pycan
 import numpy as np
@@ -48,55 +45,6 @@ def close_program():
             sys_module.exit(0)
         except Exception:
             pass
-
-# Menu stubs used by setup_main_window (placed early to avoid NameError)
-def menu_enregistrer():
-    """Fonction Enregistrer (placeholder)."""
-    try:
-        messagebox.showinfo("Enregistrer", "La fonction 'Enregistrer' n'est pas encore implémentée.")
-    except Exception:
-        pass
-
-def menu_copier():
-    """
-    Copie les données de la courbe active dans le presse-papiers sous forme CSV (semicolon-separated).
-    Format : Temps (s);Valeur
-    """
-    try:
-        active_window = get_active_plot_window()
-        if not active_window or not active_window.get('curves_data'):
-            messagebox.showwarning("Copier", "Aucune courbe disponible à copier.")
-            return
-        # If multiple curves, prefer the one selected by reticule.active_curve_index if valid
-        idx = 0
-        try:
-            idx = active_window['reticule'].active_curve_index
-        except Exception:
-            idx = 0
-        curves = active_window['curves_data']
-        if idx < 0 or idx >= len(curves):
-            idx = 0
-        t_arr, v_arr, name, is_raw = curves[idx]
-        # Build CSV text
-        lines = []
-        lines.append(f"# Courbe: {name}")
-        lines.append("Temps (s);Valeur")
-        t_list = np.asarray(t_arr).tolist()
-        v_list = np.asarray(v_arr).tolist()
-        n = max(len(t_list), len(v_list))
-        for i in range(n):
-            tval = "" if i >= len(t_list) else f"{t_list[i]:.12g}"
-            vval = "" if i >= len(v_list) else f"{v_list[i]:.12g}"
-            lines.append(f"{tval};{vval}")
-        csv_text = "\n".join(lines)
-        # Place into clipboard (text)
-        root.clipboard_clear()
-        root.clipboard_append(csv_text)
-        # Ensure clipboard is available after the program mainloop returns
-        root.update()
-        messagebox.showinfo("Copier", f"Les données de la courbe '{name}' ont été copiées dans le presse-papiers.")
-    except Exception as e:
-        messagebox.showerror("Copier", f"Impossible de copier les données: {e}")
 
 # ---------------------------
 # Global configuration & state
@@ -153,8 +101,6 @@ CALCULATED_CURVES = []
 
 # ---------------------------
 # Reticule (crosshair) class
-# Note: class kept for showing coordinates and crosshair, but the ability
-# to "link" the reticule to another curve via a dialog has been removed.
 # ---------------------------
 
 class Reticule:
@@ -271,6 +217,122 @@ def get_active_plot_window():
     return None
 
 # ---------------------------
+# Printing helpers (improved)
+# ---------------------------
+
+def _get_system_printers():
+    """
+    Retourne une liste de noms d'imprimantes disponibles sur le système.
+    Utilise win32print si disponible ; sinon tente lpstat (Unix), sinon retourne [].
+    """
+    printers = []
+    # Try win32print first (Windows / pywin32)
+    try:
+        import win32print
+        try:
+            flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+            raw = win32print.EnumPrinters(flags)
+            printers = [p[2] for p in raw if p and len(p) > 2]
+        except Exception:
+            printers = []
+    except Exception:
+        # Not on Windows or pywin32 missing: try lpstat (common on Unix with CUPS)
+        try:
+            out = subprocess.check_output(['lpstat', '-a'], stderr=subprocess.DEVNULL).decode('utf-8', errors='ignore')
+            lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+            printers = [ln.split()[0] for ln in lines if ln]
+            printers = list(dict.fromkeys(printers))  # unique preserving order
+        except Exception:
+            printers = []
+    return printers
+
+def _open_printer_settings(printer_name):
+    """
+    Ouvre le dialogue des propriétés/réglages de l'imprimante choisie si possible.
+    Sous Windows utilise printui.dll, sous Linux tente system-config-printer / lpoptions,
+    sous macOS ouvre le panneau Printers & Scanners.
+    """
+    system = platform.system()
+    try:
+        if system == 'Windows':
+            cmd = ['rundll32', 'printui.dll,PrintUIEntry', '/p', '/n', printer_name]
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        elif system == 'Darwin':
+            try:
+                subprocess.Popen(['open', '/System/Library/PreferencePanes/PrintAndScan.prefPane'])
+                return True
+            except Exception:
+                return False
+        else:
+            try:
+                subprocess.Popen(['system-config-printer', '--modify-printer', printer_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+            except Exception:
+                try:
+                    out = subprocess.check_output(['lpoptions', '-p', printer_name, '-l'], stderr=subprocess.DEVNULL).decode('utf-8', errors='ignore')
+                    dlg = tk.Toplevel(root)
+                    dlg.title(f"Options imprimante: {printer_name}")
+                    text = tk.Text(dlg, wrap='word', width=80, height=30)
+                    text.insert('1.0', out)
+                    text.config(state='disabled')
+                    text.pack(fill='both', expand=True)
+                    tk.Button(dlg, text="Fermer", command=dlg.destroy).pack(pady=6)
+                    return True
+                except Exception:
+                    return False
+    except Exception:
+        return False
+
+def _print_file_to_printer(file_path, printer_name=None):
+    """
+    Envoie le fichier image au système d'impression.
+    - Sur Unix-like : lpr -P printer file  ou lp -d printer file
+    - Sur macOS : lp -d printer file
+    - Sur Windows : os.startfile(file, 'print') (utilise imprimante par défaut)
+    Returns True if a print command was dispatched, False otherwise.
+    """
+    system = platform.system()
+    try:
+        if system == 'Windows':
+            try:
+                os.startfile(file_path, "print")
+                return True
+            except Exception:
+                return False
+        elif system == 'Darwin':
+            if printer_name:
+                cmd = ['lp', '-d', printer_name, file_path]
+            else:
+                cmd = ['lp', file_path]
+            subprocess.run(cmd, check=True)
+            return True
+        else:
+            if printer_name:
+                try:
+                    cmd = ['lpr', '-P', printer_name, file_path]
+                    subprocess.run(cmd, check=True)
+                    return True
+                except Exception:
+                    try:
+                        cmd = ['lp', '-d', printer_name, file_path]
+                        subprocess.run(cmd, check=True)
+                        return True
+                    except Exception:
+                        pass
+            try:
+                subprocess.run(['lpr', file_path], check=True)
+                return True
+            except Exception:
+                try:
+                    subprocess.run(['lp', file_path], check=True)
+                    return True
+                except Exception:
+                    return False
+    except Exception:
+        return False
+
+# ---------------------------
 # Plot creation and tabs
 # ---------------------------
 
@@ -325,7 +387,6 @@ def create_plot_in_frame(parent_frame, curves_data, title="Fenêtre Graphique", 
     for style in style_options:
         style_menu.add_radiobutton(label=style, command=lambda s=style, wd=window_data: update_plot_style(style=s, window_data=wd))
     popup_menu.add_cascade(label="Style d'Affichage", menu=style_menu)
-    # Note: popup menu entry to link reticule to a curve removed
     canvas_widget.bind("<Button-3>", lambda event: popup_menu.post(event.x_root, event.y_root))
 
     return window_data
@@ -809,8 +870,8 @@ def _show_data_table_for_curve(active_window, curve_index):
 
 # ---------------------------
 # Calculation sheet (Feuille de calcul globale)
-# Ensure this function is defined BEFORE setup_main_window (it is used by menu)
 # ---------------------------
+
 def open_calcul_sheet():
     """Feuille de calcul pour créer nouvelles grandeurs à partir des courbes présentes."""
     global CALCULATED_CURVES
@@ -904,7 +965,7 @@ def open_calcul_sheet():
     calcul_window.geometry(f'{width}x{height}+{x}+{y}')
 
 # ---------------------------
-# Modelling functions
+# Modelling, Derivative, FFT, Measurements
 # ---------------------------
 
 def f_lineaire(x, a):
@@ -1064,10 +1125,6 @@ def modeliser_puissance():
     except Exception as e:
         messagebox.showerror("Erreur Modélisation Pui.", f"Erreur: {e}")
 
-# ---------------------------
-# Derivative
-# ---------------------------
-
 def calculer_derivee():
     active_window = get_active_plot_window()
     if not active_window or not active_window['curves_data']:
@@ -1089,11 +1146,6 @@ def calculer_derivee():
     messagebox.showinfo("Calcul réussi", f"La dérivée ({grandeur_derivee}) a été calculée et ajoutée au graphique actif.")
     plot_mode_unique(active_window)
     auto_calibrate_plot(active_window)
-
-# ---------------------------
-# Automatic measurements, FFT, plotting, acquisition, etc.
-# (functions present before setup_main_window)
-# ---------------------------
 
 def _compute_period_from_peaks(t, v):
     if len(t) < 3:
@@ -1449,7 +1501,6 @@ def auto_calibrate_plot(window_data=None):
         unit = _extract_unit_from_name(nom)
         primary_unit = _extract_unit_from_name(curves_data[0][2]) if curves_data else None
         is_secondary = False
-        # corrected parentheses here (removed an extra ')')
         if i != 0 and ((unit and primary_unit and unit != primary_unit) or ('Dérivée' in nom or 'dérivée' in nom or 'derive' in nom.lower())):
             is_secondary = True
         if is_secondary:
@@ -1480,7 +1531,6 @@ def auto_calibrate_plot(window_data=None):
                 continue
             unit = _extract_unit_from_name(nom)
             primary_unit = _extract_unit_from_name(curves_data[0][2]) if curves_data else None
-            # corrected parentheses here as well
             if i != 0 and ((unit and primary_unit and unit != primary_unit) or ('Dérivée' in nom or 'dérivée' in nom or 'derive' in nom.lower())):
                 if hasattr(v, 'size') and v.size > 0:
                     sec_vs.append(v)
@@ -1693,7 +1743,6 @@ def plot_mode_unique(window_data=None):
 
 # ---------------------------
 # Mode permanent / oscillo, acquisition, exporter, rename/recolor, selection dialogs
-# (all present and defined before setup_main_window)
 # ---------------------------
 
 def plot_mode_permanent():
@@ -1756,6 +1805,7 @@ def start_acquisition_and_plot(event=None):
         messagebox.showerror("Erreur", "Impossible de déterminer la fenêtre graphique active.")
         return
     active_curves = active_window['curves_data']
+
     root.withdraw()
     if sysam_interface is not None:
         try:
@@ -1860,72 +1910,135 @@ def exporter_csv():
 
 def menu_imprimer():
     """
-    Imprime la courbe active : export PNG temporaire puis envoie au système d'impression.
-    Sur Windows utilise os.startfile(..., 'print'), sur Unix tente 'lpr'.
+    Ouvre un dialogue permettant de :
+     - choisir l'imprimante (liste construite depuis le système),
+     - ouvrir les paramètres/propriétés de l'imprimante sélectionnée,
+     - imprimer toutes les courbes visibles de l'onglet graphique actif.
+    Le dialogue fournit des options multi-plateforme 'best-effort'.
     """
     try:
         active_window = get_active_plot_window()
         if not active_window or not active_window.get('curves_data'):
             messagebox.showwarning("Imprimer", "Aucune courbe disponible à imprimer.")
             return
-        # Prefer reticule active curve if valid, otherwise first
-        idx = 0
-        try:
-            idx = active_window['reticule'].active_curve_index
-        except Exception:
-            idx = 0
+
+        # Collect visible curves from active window
+        _sync_visible_flags(active_window)
         curves = active_window['curves_data']
-        if idx < 0 or idx >= len(curves):
-            idx = 0
-        t_arr, v_arr, name, is_raw = curves[idx]
+        visible_flags = active_window.get('visible_flags', [True] * len(curves))
+        visible_curves = [(t, v, name) for (t, v, name, _), vis in zip(curves, visible_flags) if vis]
 
-        # Create a temporary figure to ensure we print only the curve (with labels)
-        fig, ax = plt.subplots(figsize=(8, 6), dpi=150)
-        ax.plot(t_arr, v_arr, color='blue', linewidth=1)
-        ax.set_title(name)
-        ax.set_xlabel("Temps (s)")
-        ax.set_ylabel(grandeur_physique_var.get() if grandeur_physique_var else "Grandeur")
-        ax.grid(True)
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.png')
-        os.close(tmp_fd)
-        try:
-            fig.savefig(tmp_path, bbox_inches='tight')
-        finally:
-            plt.close(fig)
+        if not visible_curves:
+            messagebox.showwarning("Imprimer", "Aucune courbe visible à l'impression.")
+            return
 
-        system = platform.system()
-        if system == 'Windows':
-            try:
-                os.startfile(tmp_path, "print")
-                messagebox.showinfo("Impression", "La commande d'impression a été envoyée (Windows).")
+        # Get system printers
+        printers = _get_system_printers()
+        default_printer = printers[0] if printers else None
+
+        # Build a dialog to choose printer and optionally open settings
+        dlg = tk.Toplevel(root)
+        dlg.title("Imprimer - Choix imprimante et paramètres")
+        dlg.geometry("560x220")
+        dlg.transient(root)
+
+        frm = ttk.Frame(dlg, padding=10)
+        frm.pack(fill='both', expand=True)
+
+        tk.Label(frm, text="Imprimante :", font=('Helvetica', 10, 'bold')).grid(row=0, column=0, sticky='w', padx=4, pady=6)
+        printer_var = tk.StringVar(value=default_printer or "")
+        printer_combo = ttk.Combobox(frm, values=printers if printers else ['(Aucune imprimante détectée)'], textvariable=printer_var, state='readonly' if printers else 'disabled', width=50)
+        printer_combo.grid(row=0, column=1, sticky='w', padx=4, pady=6)
+
+        def on_refresh_printers():
+            p_list = _get_system_printers()
+            if not p_list:
+                messagebox.showwarning("Imprimantes", "Aucune imprimante détectée sur le système.")
+                printer_combo.config(values=['(Aucune imprimante détectée)'], state='disabled')
+                printer_var.set('')
+            else:
+                printer_combo.config(values=p_list, state='readonly')
+                printer_var.set(p_list[0])
+
+        ttk.Button(frm, text="Rafraîchir la liste", command=on_refresh_printers).grid(row=0, column=2, sticky='w', padx=6)
+
+        tk.Label(frm, text="Options :", font=('Helvetica', 10, 'bold')).grid(row=1, column=0, sticky='nw', padx=4, pady=6)
+        options_frame = ttk.Frame(frm)
+        options_frame.grid(row=1, column=1, columnspan=2, sticky='w', padx=4)
+        copies_var = tk.IntVar(value=1)
+        tk.Label(options_frame, text="Exemplaires :").grid(row=0, column=0, sticky='w')
+        tk.Spinbox(options_frame, from_=1, to=99, width=5, textvariable=copies_var).grid(row=0, column=1, sticky='w', padx=6)
+
+        scale_var = tk.DoubleVar(value=100.0)
+        tk.Label(options_frame, text="Échelle (%):").grid(row=0, column=2, sticky='w', padx=(12,0))
+        tk.Spinbox(options_frame, from_=10, to=500, increment=10, width=6, textvariable=scale_var).grid(row=0, column=3, sticky='w', padx=6)
+
+        def open_settings():
+            pname = printer_var.get()
+            if not pname:
+                messagebox.showwarning("Paramètres", "Aucune imprimante sélectionnée.")
                 return
-            except Exception:
-                # fallback to show path
-                pass
-        else:
-            # Try lpr on Unix-like systems
-            try:
-                subprocess.run(['lpr', tmp_path], check=True)
-                messagebox.showinfo("Impression", "La commande d'impression 'lpr' a été envoyée.")
-                return
-            except Exception:
-                pass
+            ok = _open_printer_settings(pname)
+            if not ok:
+                messagebox.showinfo("Paramètres", "Impossible d'ouvrir une boîte de dialogue de paramètres pour cette imprimante sur ce système.")
 
-        # If we couldn't send to printer, offer the file path to user
-        resp = messagebox.askyesno("Imprimer", f"Impossible d'envoyer directement à l'imprimante.\nLe fichier PNG a été créé :\n{tmp_path}\n\nVoulez-vous ouvrir le dossier contenant le fichier ?")
-        if resp:
+        ttk.Button(frm, text="Paramètres de l'imprimante...", command=open_settings).grid(row=2, column=1, sticky='w', padx=4, pady=(8,0))
+
+        def do_print():
+            pname = printer_var.get() if printer_var.get() else None
+            # Render the visible curves into a temporary image (all curves on one figure)
+            fig, ax = plt.subplots(figsize=(11, 8.5), dpi=150)  # landscape-ish A4
+            for t, v, name in visible_curves:
+                try:
+                    ax.plot(t, v, label=name)
+                except Exception:
+                    pass
+            ax.set_title("Impression - Affichage courant")
+            ax.set_xlabel("Temps (s)")
+            ax.set_ylabel(grandeur_physique_var.get() if grandeur_physique_var else "Grandeur")
+            ax.grid(True)
+            ax.legend(loc='upper right', fontsize='small')
+
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix='.png')
+            os.close(tmp_fd)
             try:
-                folder = os.path.dirname(tmp_path)
-                if platform.system() == 'Windows':
-                    os.startfile(folder)
-                elif platform.system() == 'Darwin':
-                    subprocess.run(['open', folder])
-                else:
-                    subprocess.run(['xdg-open', folder])
-            except Exception:
-                messagebox.showinfo("Imprimer", f"Ouvrez manuellement : {tmp_path}")
+                fig.savefig(tmp_path, bbox_inches='tight')
+            finally:
+                plt.close(fig)
+
+            dispatched = _print_file_to_printer(tmp_path, printer_name=pname)
+            if dispatched:
+                messagebox.showinfo("Imprimer", "La tâche d'impression a été envoyée au système (commande envoyée).")
+                dlg.destroy()
+            else:
+                resp = messagebox.askyesno("Imprimer", f"Impossible d'envoyer le fichier directement à l'imprimante.\nLe fichier PNG a été créé :\n{tmp_path}\n\nVoulez-vous ouvrir le dossier contenant le fichier pour imprimer manuellement ?")
+                if resp:
+                    try:
+                        folder = os.path.dirname(tmp_path)
+                        if platform.system() == 'Windows':
+                            os.startfile(folder)
+                        elif platform.system() == 'Darwin':
+                            subprocess.run(['open', folder])
+                        else:
+                            subprocess.run(['xdg-open', folder])
+                    except Exception:
+                        messagebox.showinfo("Imprimer", f"Ouvrez manuellement : {tmp_path}")
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=4, column=0, columnspan=3, pady=12)
+        ttk.Button(btns, text="Imprimer", command=do_print).pack(side='left', padx=6)
+        ttk.Button(btns, text="Annuler", command=dlg.destroy).pack(side='right', padx=6)
+
+        dlg.grab_set()
+        dlg.focus_force()
+        dlg.wait_window()
+
     except Exception as e:
         messagebox.showerror("Imprimer", f"Erreur lors de l'impression : {e}")
+
+# ---------------------------
+# Rename / recolor / select curve / copy to clipboard
+# ---------------------------
 
 def rename_curve_dialog():
     active_window = get_active_plot_window()
@@ -1986,9 +2099,45 @@ def select_curve_dialog(active_window, title="Sélection de la courbe"):
     root.wait_window(selection_window)
     return tuple(result) if result else None
 
+def menu_copier():
+    """
+    Copie les données de la courbe active dans le presse-papiers sous forme CSV (semicolon-separated).
+    Format : Temps (s);Valeur
+    """
+    try:
+        active_window = get_active_plot_window()
+        if not active_window or not active_window.get('curves_data'):
+            messagebox.showwarning("Copier", "Aucune courbe disponible à copier.")
+            return
+        idx = 0
+        try:
+            idx = active_window['reticule'].active_curve_index
+        except Exception:
+            idx = 0
+        curves = active_window['curves_data']
+        if idx < 0 or idx >= len(curves):
+            idx = 0
+        t_arr, v_arr, name, is_raw = curves[idx]
+        lines = []
+        lines.append(f"# Courbe: {name}")
+        lines.append("Temps (s);Valeur")
+        t_list = np.asarray(t_arr).tolist()
+        v_list = np.asarray(v_arr).tolist()
+        n = max(len(t_list), len(v_list))
+        for i in range(n):
+            tval = "" if i >= len(t_list) else f"{t_list[i]:.12g}"
+            vval = "" if i >= len(v_list) else f"{v_list[i]:.12g}"
+            lines.append(f"{tval};{vval}")
+        csv_text = "\n".join(lines)
+        root.clipboard_clear()
+        root.clipboard_append(csv_text)
+        root.update()
+        messagebox.showinfo("Copier", f"Les données de la courbe '{name}' ont été copiées dans le presse-papiers.")
+    except Exception as e:
+        messagebox.showerror("Copier", f"Impossible de copier les données: {e}")
+
 # ---------------------------
 # Main window & menus
-# All handlers referenced here are defined above to avoid NameError
 # ---------------------------
 
 def update_fe_and_xaxis(event=None):
@@ -2141,9 +2290,10 @@ def setup_main_window():
     global plot_style_var
 
     root = tk.Tk()
-    root.title("Acquisition Sysam SP5 - Alternative LatisPro")
+    root.title("Acquisition Sysam SP5 - Alternative LatisPro (v17)")
     root.protocol("WM_DELETE_WINDOW", close_program)
-    root.bind('<F10>', start_acquisition_and_plot)
+    # bind F10 using a lambda so the name start_acquisition_and_plot is resolved at event time
+    root.bind('<F10>', lambda event: start_acquisition_and_plot(event))
 
     duree_var = tk.StringVar(value=str(Config.DUREE))
     nb_points_var = tk.StringVar(value=str(Config.N_POINTS))
@@ -2169,8 +2319,7 @@ def setup_main_window():
     menubar.add_cascade(label="Fichier", menu=file_menu)
     file_menu.add_command(label="Nouveau", command=menu_nouveau)
     file_menu.add_command(label="Ouvrir...", command=menu_ouvrir)
-    # Note: entry "Ouvrir (.ltp)..." removed
-    file_menu.add_command(label="Enregistrer...", command=menu_enregistrer)
+    file_menu.add_command(label="Enregistrer...", command=lambda: messagebox.showinfo("Enregistrer", "Non implémenté"))
     file_menu.add_command(label="Exporter (CSV)...", command=exporter_csv)
     file_menu.add_separator()
     file_menu.add_command(label="Imprimer la courbe...", command=menu_imprimer)
@@ -2207,9 +2356,7 @@ def setup_main_window():
     menubar.add_cascade(label="Options", menu=options_menu)
     options_menu.add_command(label="Calibrage Auto (Optimiser l'Affichage)", command=lambda: auto_calibrate_plot())
     options_menu.add_command(label="Décalibrer (Retour affichage initial)", command=lambda: de_calibrate_plot())
-    # Note: menu command "Réticule lié à la courbe..." removed here
     options_menu.add_separator()
-    # rename / recolor
     options_menu.add_command(label="Renommer la courbe...", command=rename_curve_dialog)
     options_menu.add_command(label="Recolorer la courbe...", command=recolor_curve_dialog)
     options_menu.add_separator()
@@ -2330,7 +2477,8 @@ def setup_main_window():
     row_idx += 1
 
     update_trigger_fields()
-    tk.Button(control_frame, text="Démarrer l'Acquisition (ou F10)", command=start_acquisition_and_plot, font='Helvetica 12 bold', pady=5).grid(row=row_idx, column=0, columnspan=2, pady=10)
+    # use lambda to avoid NameError if function reference not resolved yet
+    tk.Button(control_frame, text="Démarrer l'Acquisition (ou F10)", command=lambda: start_acquisition_and_plot(None), font='Helvetica 12 bold', pady=5).grid(row=row_idx, column=0, columnspan=2, pady=10)
 
     # Plot area on the right
     plot_frame_container = tk.Frame(main_frame, bd=2, relief=tk.SUNKEN)
